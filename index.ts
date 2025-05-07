@@ -64,201 +64,290 @@ const aggregateSignature = (
     return concat(signaturesWithAddress.map(({ signature }) => signature));
 };
 
+// Helper function to sign a user operation with multiple signers and aggregate the signatures
+async function signUserOperationWithMultisig(
+    userOperation: any,
+    signers: { walletClient: WalletClient, account: any }[],
+    smartAccount: MetaMaskSmartAccount
+): Promise<Hex> {
+    const signaturesWithAddress = [];
+    for (const { walletClient, account } of signers) {
+        const signature = await signUserOperation(userOperation, walletClient, smartAccount);
+        signaturesWithAddress.push({ signature, address: account.address });
+    }
+    return aggregateSignature(signaturesWithAddress);
+}
+
+// Function to fund the AA wallet
+async function fundAAWallet(
+    provider: ethers.JsonRpcProvider,
+    toAddress: string,
+    amount: bigint
+) {
+    const wallet = new ethers.Wallet(process.env.PRIVATE_KEY!, provider);
+    const tx = {
+        to: toAddress,
+        value: amount
+    };
+    const txResponse = await wallet.sendTransaction(tx);
+    console.log('Funding transaction sent:', txResponse.hash);
+    await txResponse.wait();
+    console.log('Funding transaction confirmed');
+}
+
+// Function to send transaction using multisig
+async function sendTransactionWithMultisig(
+    bundlerClient: any,
+    smartAccount: MetaMaskSmartAccount,
+    walletClient1: WalletClient,
+    walletClient2: WalletClient,
+    walletClientAccount1: any,
+    walletClientAccount2: any,
+    recipient: Address,
+    amount: bigint,
+    pimlicoClient: any
+) {
+    // Get fresh fee estimates from Pimlico
+    const {fast: newFees} = await pimlicoClient.getUserOperationGasPrice();
+
+    // Create the user operation for sending ETH
+    const userOperation = await bundlerClient.prepareUserOperation({
+        account: smartAccount,
+        calls: [
+            {
+                to: recipient,
+                value: amount,
+                data: '0x'
+            }
+        ],
+        ...newFees,
+    });
+
+    // Sign with both signers using the helper
+    console.log('Signing transaction with both signers...');
+    const combinedSignature = await signUserOperationWithMultisig(
+        userOperation,
+        [
+            { walletClient: walletClient1, account: walletClientAccount1 },
+            { walletClient: walletClient2, account: walletClientAccount2 }
+        ],
+        smartAccount
+    );
+
+    // Add signature to user operation
+    const signedUserOperation = {
+        ...userOperation,
+        signature: combinedSignature
+    };
+
+    // Send the signed user operation
+    const hash = await bundlerClient.sendUserOperation(signedUserOperation);
+    console.log('Transaction sent!');
+    console.log('Transaction hash:', hash);
+    return hash;
+}
+
+// --- SETUP SECTION ---
+async function setup() {
+    if (!process.env.RPC_URL) {
+        throw new Error('Please set RPC_URL in your .env file');
+    }
+    if (!process.env.PRIVATE_KEY) {
+        throw new Error('Please set PRIVATE_KEY in your .env file');
+    }
+    if (!process.env.BUNDLER_URL) {
+        throw new Error('Please set BUNDLER_URL in your .env file');
+    }
+
+    const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
+    const network = await provider.getNetwork();
+    if (network.chainId !== BigInt(SEPOLIA_CHAIN_ID)) {
+        throw new Error(`Wrong network. Expected Sepolia (${SEPOLIA_CHAIN_ID}), got chain ID ${network.chainId}`);
+    }
+
+    const environment: DeleGatorEnvironment = getDeleGatorEnvironment(SEPOLIA_CHAIN_ID);
+    const publicClient = createPublicClient({
+        chain: sepolia,
+        transport: http(process.env.RPC_URL)
+    });
+    const paymasterClient = createPaymasterClient({ 
+        transport: http('https://public.pimlico.io/v2/11155111/rpc'), 
+    });
+    const { createPimlicoClient } = await import("permissionless/clients/pimlico");
+    const pimlicoClient = createPimlicoClient({
+        transport: http(process.env.BUNDLER_URL),
+    });
+    const {fast: fees} = await pimlicoClient.getUserOperationGasPrice();
+    const bundlerClient = createBundlerClient({
+        transport: http(process.env.BUNDLER_URL),
+        paymaster: paymasterClient,
+        chain: sepolia
+    });
+    const localAccount = privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`);
+    const walletClientPivatekey1 = generatePrivateKey(); 
+    const walletClientAccount1 = privateKeyToAccount(walletClientPivatekey1);
+    const walletClientPivatekey2 = generatePrivateKey(); 
+    const walletClientAccount2 = privateKeyToAccount(walletClientPivatekey2);
+    const walletClient1 = createWalletClient({
+        account: walletClientAccount1,
+        chain: sepolia,
+        transport: http(process.env.RPC_URL)
+    });
+    const walletClient2 = createWalletClient({
+        account: walletClientAccount2,
+        chain: sepolia,
+        transport: http(process.env.RPC_URL)
+    });
+    return {
+        provider,
+        environment,
+        publicClient,
+        paymasterClient,
+        pimlicoClient,
+        fees,
+        bundlerClient,
+        localAccount,
+        walletClientAccount1,
+        walletClientAccount2,
+        walletClient1,
+        walletClient2
+    };
+}
+
+// --- DELEGATION & REDEEM SECTION ---
+async function delegationAndRedeem({
+    publicClient,
+    localAccount,
+    walletClientAccount1,
+    walletClientAccount2,
+    walletClient1,
+    walletClient2,
+    bundlerClient,
+    fees
+}: any) {
+    // Create delegator account (Hybrid implementation)
+    const delegatorSmartAccount = await toMetaMaskSmartAccount({
+        client: publicClient,
+        implementation: Implementation.Hybrid,
+        deployParams: [localAccount.address, [], [], []],
+        deploySalt: "0x",
+        signatory: { account: localAccount }
+    });
+    console.log('Delegator Smart Account created:', delegatorSmartAccount.address);
+
+    // Create delegatee account (MultiSig implementation)
+    const signers = [walletClientAccount1.address, walletClientAccount2.address];
+    const threshold = BigInt(2);
+    const signatory = [
+        { account: walletClientAccount1 },
+        { account: walletClientAccount2 }
+    ];
+    const delegateeSmartAccount = await toMetaMaskSmartAccount({
+        client: publicClient,
+        implementation: Implementation.MultiSig,
+        deployParams: [signers, threshold],
+        deploySalt: "0x",
+        signatory
+    });
+    console.log('Delegate Smart Account created:', delegateeSmartAccount.address);
+
+    // Create delegation from delegator to delegatee
+    const delegation = createDelegation({
+        to: delegateeSmartAccount.address,
+        from: delegatorSmartAccount.address,
+        caveats: []
+    });
+    console.log('Delegation created:', JSON.stringify(delegation, null, 2));
+
+    // Sign the delegation
+    const signature = await delegatorSmartAccount.signDelegation({ delegation });
+    const signedDelegation = { ...delegation, signature };
+
+    // Encode the redeem delegation call with empty execution
+    const executions = [{
+        target: zeroAddress,  
+        value: 0n, 
+        callData: '0x' as `0x${string}`
+    }];
+    const redeemDelegationCalldata = DelegationFramework.encode.redeemDelegations({
+        delegations: [[signedDelegation]],
+        modes: [SINGLE_DEFAULT_MODE],
+        executions: [executions]
+    });
+
+    // Send user operation to redeem delegation
+    const userOperation = await bundlerClient.prepareUserOperation({
+        account: delegateeSmartAccount,
+        calls: [
+            {
+                to: delegatorSmartAccount.address,
+                data: redeemDelegationCalldata
+            }
+        ],
+        ...fees,
+    });
+    const combinedSignature = await signUserOperationWithMultisig(
+        userOperation,
+        [
+            { walletClient: walletClient1, account: walletClientAccount1 },
+            { walletClient: walletClient2, account: walletClientAccount2 }
+        ],
+        delegateeSmartAccount
+    );
+    const signedUserOperation = {
+        ...userOperation,
+        signature: combinedSignature
+    };
+    const hash = await bundlerClient.sendUserOperation(signedUserOperation);
+    console.log('User operation sent!');
+    console.log('User operation hash:', hash);
+    return { delegatorSmartAccount, delegateeSmartAccount };
+}
+
+// --- FUNDING & RETURNING SECTION ---
+async function fundingAndReturning({
+    provider,
+    delegatorSmartAccount,
+    localAccount,
+    bundlerClient,
+    walletClient1,
+    walletClient2,
+    walletClientAccount1,
+    walletClientAccount2,
+    pimlicoClient
+}: any) {
+    // Fund the delegator smart account
+    console.log('Funding the AA wallet...');
+    await fundAAWallet(
+        provider,
+        delegatorSmartAccount.address,
+        parseEther('0.005')
+    );
+    // Send transaction back to local wallet using multisig
+    console.log('Sending transaction back to local wallet using multisig...');
+    await sendTransactionWithMultisig(
+        bundlerClient,
+        delegatorSmartAccount,
+        walletClient1,
+        walletClient2,
+        walletClientAccount1,
+        walletClientAccount2,
+        localAccount.address,
+        parseEther('0.005'),
+        pimlicoClient
+    );
+}
+
+// --- MAIN ---
 async function main() {
     try {
-        // Initialize provider using JSON RPC URL
-        if (!process.env.RPC_URL) {
-            throw new Error('Please set RPC_URL in your .env file');
-        }
-        if (!process.env.PRIVATE_KEY) {
-            throw new Error('Please set PRIVATE_KEY in your .env file');
-        }
-        if (!process.env.BUNDLER_URL) {
-            throw new Error('Please set BUNDLER_URL in your .env file');
-        }
-
-        const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
-        
-        // Verify we're on Sepolia
-        const network = await provider.getNetwork();
-        if (network.chainId !== BigInt(SEPOLIA_CHAIN_ID)) {
-            throw new Error(`Wrong network. Expected Sepolia (${SEPOLIA_CHAIN_ID}), got chain ID ${network.chainId}`);
-        }
-
-        // Get the delegator environment for Sepolia
-        const environment: DeleGatorEnvironment = getDeleGatorEnvironment(SEPOLIA_CHAIN_ID);
-        console.log('Delegator environment:', environment);
-        
-        // Create public client for Sepolia
-        const publicClient = createPublicClient({
-            chain: sepolia,
-            transport: http(process.env.RPC_URL)
+        const setupResult = await setup();
+        const { delegatorSmartAccount, delegateeSmartAccount } = await delegationAndRedeem(setupResult);
+        await fundingAndReturning({
+            ...setupResult,
+            delegatorSmartAccount,
+            delegateeSmartAccount
         });
-
-        const paymasterClient = createPaymasterClient({ 
-            transport: http('https://public.pimlico.io/v2/11155111/rpc'), 
-        })
-
-        const { createPimlicoClient } = await import("permissionless/clients/pimlico");
-        const pimlicoClient = createPimlicoClient({
-            transport: http(process.env.BUNDLER_URL),
-        });
-        const {fast: fees} = await pimlicoClient.getUserOperationGasPrice();
-
-        // Create bundler client
-        const bundlerClient = createBundlerClient({
-            transport: http(process.env.BUNDLER_URL),
-            paymaster: paymasterClient,
-            chain: sepolia
-        });
-
-        // Create delegator account (Hybrid implementation)
-        const localAccount = privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`);
-        console.log('Creating delegator account with address:', localAccount.address);
-        
-        const delegatorSmartAccount = await toMetaMaskSmartAccount({
-            client: publicClient,
-            implementation: Implementation.Hybrid,
-            deployParams: [localAccount.address, [], [], []],
-            deploySalt: "0x",
-            signatory: { account: localAccount }
-        });
-        console.log('Delegator Smart Account created:', delegatorSmartAccount.address);
-
-        // Create delegatee account (MultiSig implementation)
-        console.log('Creating delegatee account with signers:');
-        const walletClientPivatekey1 = generatePrivateKey(); 
-        const walletClientAccount1 = privateKeyToAccount(walletClientPivatekey1);
-        console.log('Signer 1:', walletClientAccount1.address);
-        
-        const walletClientPivatekey2 = generatePrivateKey(); 
-        const walletClientAccount2 = privateKeyToAccount(walletClientPivatekey2);
-        console.log('Signer 2:', walletClientAccount2.address);
-
-        const signers = [walletClientAccount1.address, walletClientAccount2.address];
-        const threshold = BigInt(2);
-        const signatory = [
-            { account: walletClientAccount1 },
-            { account: walletClientAccount2 }
-        ];
-
-        const delegateeSmartAccount = await toMetaMaskSmartAccount({
-            client: publicClient,
-            implementation: Implementation.MultiSig,
-            deployParams: [signers, threshold],
-            deploySalt: "0x",
-            signatory
-        });
-        console.log('Delegate Smart Account created:', delegateeSmartAccount.address);
-
-
-        // Create delegation from delegator to delegatee
-        console.log('Creating delegation...');
-        const delegation = createDelegation({
-            to: delegateeSmartAccount.address,
-            from: delegatorSmartAccount.address,
-            caveats: [] // Empty caveats array - we recommend adding appropriate restrictions
-        });
-        console.log('Delegation created:', JSON.stringify(delegation, null, 2));
-
-        // Sign the delegation
-        console.log('Signing delegation...');
-        try {
-            const signature = await delegatorSmartAccount.signDelegation({
-                delegation
-            });
-            console.log('Delegation signed with signature:', signature);
-
-            const signedDelegation = {
-                ...delegation,
-                signature
-            };
-
-            // Encode the redeem delegation call with empty execution
-            console.log('Encoding redeem delegation call...');
-            const executions = [{
-                target: zeroAddress,  
-                value: 0n, 
-                callData: '0x' as `0x${string}`
-            }];
-
-            const redeemDelegationCalldata = DelegationFramework.encode.redeemDelegations({
-                delegations: [[signedDelegation]],
-                modes: [SINGLE_DEFAULT_MODE],
-                executions: [executions]
-            });
-            console.log('Redeem delegation calldata:', redeemDelegationCalldata);
-
-            // Send user operation to redeem delegation
-            console.log('Sending user operation to redeem delegation...');
-            try {
-                // Create the user operation
-                const userOperation = await bundlerClient.prepareUserOperation({
-                    account: delegateeSmartAccount,
-                    calls: [
-                        {
-                            to: delegatorSmartAccount.address,
-                            data: redeemDelegationCalldata
-                        }
-                    ],
-                    ...fees,
-                });
-
-                // Get the user operation hash
-                // const userOperationHash = getUserOperationHash({
-                //     userOperation,
-                //     entryPointAddress: environment.EntryPoint as `0x${string}`,
-                //     chainId: SEPOLIA_CHAIN_ID,
-                //     entryPointVersion: '0.6'
-                // });
-
-                // Sign with both signers
-                console.log('Signing user operation with both signers...');
-                const walletClient1 = createWalletClient({
-                    account: walletClientAccount1,
-                    chain: sepolia,
-                    transport: http(process.env.RPC_URL)
-                });
-                  
-                const walletClient2 = createWalletClient({
-                    account: walletClientAccount2,
-                    chain: sepolia,
-                    transport: http(process.env.RPC_URL)
-                });
-                  
-                const signature1 = await signUserOperation(userOperation, walletClient1, delegateeSmartAccount);
-                const signature2 = await signUserOperation(userOperation, walletClient2, delegateeSmartAccount);
-                
-                const combinedSignature = aggregateSignature([
-                    { signature: signature1, address: walletClientAccount1.address },
-                    { signature: signature2, address: walletClientAccount2.address },
-                ]);
-
-                // Add signature to user operation
-                const signedUserOperation = {
-                    ...userOperation,
-                    signature: combinedSignature
-                };
-
-                // Send the signed user operation
-                const hash = await bundlerClient.sendUserOperation(signedUserOperation);
-                
-                console.log('User operation sent!');
-                console.log('User operation hash:', hash);
-            } catch (error) {
-                console.error('Error sending user operation:', error);
-                if (error instanceof Error) {
-                    console.error('Error details:', error.message);
-                    console.error('Error stack:', error.stack);
-                }
-            }
-        } catch (error) {
-            console.error('Error signing delegation:', error);
-            if (error instanceof Error) {
-                console.error('Error details:', error.message);
-                console.error('Error stack:', error.stack);
-            }
-        }
     } catch (error) {
         console.error('Error:', error);
         process.exit(1);
