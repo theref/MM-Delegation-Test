@@ -40,8 +40,6 @@ dotenv.config();
 // Sepolia network configuration
 const SEPOLIA_CHAIN_ID = 11155111;
 
-// Example recipient address for the transaction
-const RECIPIENT_ADDRESS = '0x2215a197a32834ef93C4D1029551bB8D3B924DCc' as `0x${string}`;
 
 const signUserOperation = async (params: SignUserOperationParams, owner: WalletClient, smartAccount: MetaMaskSmartAccount) => {
     const { chainId } = params;
@@ -192,15 +190,11 @@ async function setup() {
  * Creates the Hybrid (delegator) and MultiSig (delegatee) smart accounts, sets up delegation, and redeems it.
  * Returns the smart accounts and signed delegation.
  */
-async function delegationAndRedeem({
+async function Delegate({
     publicClient,
     localAccount,
     walletClientAccount1,
     walletClientAccount2,
-    walletClient1,
-    walletClient2,
-    bundlerClient,
-    fees
 }: any) {
     console.log('\n--- DELEGATION & REDEEM ---');
     // Create delegator account (Hybrid implementation)
@@ -240,52 +234,6 @@ async function delegationAndRedeem({
     // Sign the delegation
     const signature = await userSmartAccount.signDelegation({ delegation });
     const signedDelegation = { ...delegation, signature };
-
-    // Encode the redeem delegation call with empty execution
-    const executions = [{
-        target: zeroAddress,  
-        value: 0n, 
-        callData: '0x' as `0x${string}`
-    }];
-    const redeemDelegationCalldata = DelegationFramework.encode.redeemDelegations({
-        delegations: [[signedDelegation]],
-        modes: [SINGLE_DEFAULT_MODE],
-        executions: [executions]
-    });
-
-    // Send user operation to redeem delegation
-    const userOperation = await bundlerClient.prepareUserOperation({
-        account: multisigSmartAccount,
-        calls: [
-            {
-                to: userSmartAccount.address,
-                data: redeemDelegationCalldata
-            }
-        ],
-        ...fees,
-    });
-    const combinedSignature = await signUserOperationWithMultisig(
-        userOperation,
-        [
-            { walletClient: walletClient1, account: walletClientAccount1 },
-            { walletClient: walletClient2, account: walletClientAccount2 }
-        ],
-        multisigSmartAccount
-    );
-    const signedUserOperation = {
-        ...userOperation,
-        signature: combinedSignature
-    };
-    const userOpHash = await bundlerClient.sendUserOperation(signedUserOperation);
-    console.log('Redemption UserOperation hash:', userOpHash);
-    // Wait for the UserOperation to be mined
-    const receipt = await bundlerClient.waitForUserOperationReceipt({
-        hash: userOpHash,
-        pollingInterval: 1000,
-        retryCount: 100
-    });
-    console.log('Redemption transaction hash:', receipt.receipt.transactionHash);
-    console.log('View on Etherscan:', `https://sepolia.etherscan.io/tx/${receipt.receipt.transactionHash}`);
     return { userSmartAccount, multisigSmartAccount, signedDelegation };
 }
 
@@ -319,25 +267,10 @@ async function fundingAndReturning({
     // Log balance after funding
     await logBalance('User Smart Account (after funding)', provider, userSmartAccount.address);
     console.log('Returning funds through delegation...');
-    const encodedCall = encodeFunctionData({
-        abi: [{
-          type: 'function',
-          name: 'execute',
-          stateMutability: 'payable',
-          inputs: [
-            { name: 'target', type: 'address' },
-            { name: 'value', type: 'uint256' },
-            { name: 'data', type: 'bytes' },
-          ],
-          outputs: []
-        }],
-        functionName: 'execute',
-        args: [localAccount.address, parseEther('0.001'), '0x'],
-    });
     const executions = [{
-        target: userSmartAccount.address,
-        value: 0n, // The Hybrid delegator sends, not the Delegatee
-        callData: encodedCall
+        target: localAccount.address,  
+        value: 100000n,
+        callData: '0x' as `0x${string}`
     }];
     const returnFundsCalldata = DelegationFramework.encode.redeemDelegations({
       delegations: [[signedDelegation]],
@@ -387,7 +320,7 @@ async function fundingAndReturning({
 (async function main() {
     try {
         const setupResult = await setup();
-        const { userSmartAccount, multisigSmartAccount, signedDelegation } = await delegationAndRedeem(setupResult);
+        const { userSmartAccount, multisigSmartAccount, signedDelegation } = await Delegate(setupResult);
         await fundingAndReturning({
             ...setupResult,
             userSmartAccount,
