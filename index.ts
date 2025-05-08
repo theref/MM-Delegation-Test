@@ -195,6 +195,9 @@ async function Delegate({
     localAccount,
     walletClientAccount1,
     walletClientAccount2,
+    pimlicoClient,
+    bundlerClient,
+    paymasterClient
 }: any) {
     console.log('\n--- DELEGATION & REDEEM ---');
     // Create delegator account (Hybrid implementation)
@@ -204,6 +207,22 @@ async function Delegate({
         deployParams: [localAccount.address, [], [], []],
         deploySalt: "0x",
         signatory: { account: localAccount }
+    });
+    const { fast: fee } = await pimlicoClient!.getUserOperationGasPrice();
+
+    const userOperationHash = await bundlerClient!.sendUserOperation({
+      account: userSmartAccount,
+      calls: [
+        {
+          to: zeroAddress,
+        },
+      ],
+      paymaster: paymasterClient,
+      ...fee,
+    });
+
+    const { receipt } = await bundlerClient!.waitForUserOperationReceipt({
+      hash: userOperationHash,
     });
     console.log('User Smart Account created:', userSmartAccount.address);
 
@@ -269,7 +288,7 @@ async function fundingAndReturning({
     console.log('Returning funds through delegation...');
     const executions = [{
         target: localAccount.address,  
-        value: 100000n,
+        value: parseEther('0.005'),
         callData: '0x' as `0x${string}`
     }];
     const returnFundsCalldata = DelegationFramework.encode.redeemDelegations({
