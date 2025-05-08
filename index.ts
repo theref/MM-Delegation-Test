@@ -1,3 +1,16 @@
+// ============================================================================
+// MetaMask Delegation Toolkit Multisig Example
+// ----------------------------------------------------------------------------
+// This script demonstrates how to:
+// 1. Set up a Hybrid (delegator) and MultiSig (delegatee) smart account
+// 2. Delegate authority from the Hybrid to the MultiSig
+// 3. Redeem the delegation
+// 4. Fund the Hybrid account
+// 5. Use the MultiSig to return funds from the Hybrid to a local EOA
+//
+// This file is designed as a readable, step-by-step tutorial for developers.
+// ============================================================================
+
 import { 
     createDelegation,
     getDeleGatorEnvironment,
@@ -153,8 +166,13 @@ async function logBalance(label: string, provider: ethers.JsonRpcProvider, addre
     console.log(`${label} balance:`, ethers.formatEther(balance), 'ETH');
 }
 
-// --- SETUP SECTION ---
+// === 1. SETUP ===
+/**
+ * Sets up all clients, accounts, and environment variables.
+ * Returns an object with all necessary handles for the rest of the flow.
+ */
 async function setup() {
+    console.log('--- SETUP ---');
     if (!process.env.RPC_URL) {
         throw new Error('Please set RPC_URL in your .env file');
     }
@@ -220,7 +238,11 @@ async function setup() {
     };
 }
 
-// --- DELEGATION & REDEEM SECTION ---
+// === 2. DELEGATION & REDEEM ===
+/**
+ * Creates the Hybrid (delegator) and MultiSig (delegatee) smart accounts, sets up delegation, and redeems it.
+ * Returns the smart accounts and signed delegation.
+ */
 async function delegationAndRedeem({
     publicClient,
     localAccount,
@@ -231,6 +253,7 @@ async function delegationAndRedeem({
     bundlerClient,
     fees
 }: any) {
+    console.log('\n--- DELEGATION & REDEEM ---');
     // Create delegator account (Hybrid implementation)
     const delegatorSmartAccount = await toMetaMaskSmartAccount({
         client: publicClient,
@@ -309,7 +332,10 @@ async function delegationAndRedeem({
     return { delegatorSmartAccount, delegateeSmartAccount, signedDelegation };
 }
 
-// --- FUNDING & RETURNING SECTION ---
+// === 3. FUNDING & RETURNING ===
+/**
+ * Funds the Hybrid account and uses the MultiSig to return funds to the local EOA via the delegation framework.
+ */
 async function fundingAndReturning({
     provider,
     delegatorSmartAccount,
@@ -323,6 +349,7 @@ async function fundingAndReturning({
     walletClientAccount2,
     pimlicoClient
 }: any) {
+    console.log('\n--- FUNDING & RETURNING ---');
     // Log balance before funding
     await logBalance('Delegator (before funding)', provider, delegatorSmartAccount.address);
     // Fund the delegator smart account
@@ -394,8 +421,8 @@ async function fundingAndReturning({
 
 }
 
-// --- MAIN ---
-async function main() {
+// === MAIN FLOW ===
+(async function main() {
     try {
         const setupResult = await setup();
         const { delegatorSmartAccount, delegateeSmartAccount, signedDelegation } = await delegationAndRedeem(setupResult);
@@ -405,11 +432,9 @@ async function main() {
             delegateeSmartAccount,
             signedDelegation
         });
+        console.log('\nAll done!');
     } catch (error) {
         console.error('Error:', error);
         process.exit(1);
     }
-}
-
-// Run the demo
-main();
+})();
