@@ -109,59 +109,6 @@ async function fundAAWallet(
     console.log('Funding transaction confirmed');
 }
 
-// Function to send transaction using multisig
-async function sendTransactionWithMultisig(
-    bundlerClient: any,
-    smartAccount: MetaMaskSmartAccount,
-    walletClient1: WalletClient,
-    walletClient2: WalletClient,
-    walletClientAccount1: any,
-    walletClientAccount2: any,
-    recipient: Address,
-    amount: bigint,
-    pimlicoClient: any
-) {
-    // Get fresh fee estimates from Pimlico
-    const {fast: newFees} = await pimlicoClient.getUserOperationGasPrice();
-
-    // Create the user operation for sending ETH
-    const userOperation = await bundlerClient.prepareUserOperation({
-        account: smartAccount,
-        calls: [
-            {
-                to: recipient,
-                value: amount,
-                data: '0x'
-            }
-        ],
-        ...newFees,
-    });
-
-    // Sign with both signers using the helper
-    console.log('Signing transaction with both signers...');
-    const combinedSignature = await signUserOperationWithMultisig(
-        userOperation,
-        [
-            { walletClient: walletClient1, account: walletClientAccount1 },
-            { walletClient: walletClient2, account: walletClientAccount2 }
-        ],
-        smartAccount
-    );
-
-    // Add signature to user operation
-    const signedUserOperation = {
-        ...userOperation,
-        signature: combinedSignature
-    };
-
-    // Send the signed user operation
-    const hash = await bundlerClient.sendUserOperation(signedUserOperation);
-    console.log('Transaction sent!');
-    console.log('Transaction hash:', hash);
-    console.log('View on Etherscan:', `https://sepolia.etherscan.io/tx/${hash}`);
-    return hash;
-}
-
 // Helper to fetch and log ETH balance
 async function logBalance(label: string, provider: ethers.JsonRpcProvider, address: string) {
     const balance = await provider.getBalance(address);
