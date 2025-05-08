@@ -104,6 +104,7 @@ async function fundAAWallet(
     };
     const txResponse = await wallet.sendTransaction(tx);
     console.log('Funding transaction sent:', txResponse.hash);
+    console.log('View on Etherscan:', `https://sepolia.etherscan.io/tx/${txResponse.hash}`);
     await txResponse.wait();
     console.log('Funding transaction confirmed');
 }
@@ -157,6 +158,7 @@ async function sendTransactionWithMultisig(
     const hash = await bundlerClient.sendUserOperation(signedUserOperation);
     console.log('Transaction sent!');
     console.log('Transaction hash:', hash);
+    console.log('View on Etherscan:', `https://sepolia.etherscan.io/tx/${hash}`);
     return hash;
 }
 
@@ -327,8 +329,16 @@ async function delegationAndRedeem({
         ...userOperation,
         signature: combinedSignature
     };
-    const hash = await bundlerClient.sendUserOperation(signedUserOperation);
-    console.log('Redemption sent!:', hash);
+    const userOpHash = await bundlerClient.sendUserOperation(signedUserOperation);
+    console.log('Redemption UserOperation hash:', userOpHash);
+    // Wait for the UserOperation to be mined
+    const receipt = await bundlerClient.waitForUserOperationReceipt({
+        hash: userOpHash,
+        pollingInterval: 1000,
+        retryCount: 10
+    });
+    console.log('Redemption transaction hash:', receipt.receipt.transactionHash);
+    console.log('View on Etherscan:', `https://sepolia.etherscan.io/tx/${receipt.receipt.transactionHash}`);
     return { delegatorSmartAccount, delegateeSmartAccount, signedDelegation };
 }
 
@@ -411,11 +421,19 @@ async function fundingAndReturning({
       delegateeSmartAccount
     );
     console.log('Return funds user operation sent!');
-    const hash = await bundlerClient.sendUserOperation({
+    const userOpHash = await bundlerClient.sendUserOperation({
       ...returnFundsUserOp,
       signature: returnFundsSig
     });
-    console.log('Return funds user operation hash:', hash);
+    console.log('Return funds UserOperation hash:', userOpHash);
+    // Wait for the UserOperation to be mined
+    const receipt = await bundlerClient.waitForUserOperationReceipt({
+        hash: userOpHash,
+        pollingInterval: 1000,
+        retryCount: 10
+    });
+    console.log('Return funds transaction hash:', receipt.receipt.transactionHash);
+    console.log('View on Etherscan:', `https://sepolia.etherscan.io/tx/${receipt.receipt.transactionHash}`);
     // Log balance after return
     await logBalance('Delegator (after return)', provider, delegatorSmartAccount.address);
 
