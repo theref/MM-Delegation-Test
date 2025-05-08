@@ -204,14 +204,14 @@ async function delegationAndRedeem({
 }: any) {
     console.log('\n--- DELEGATION & REDEEM ---');
     // Create delegator account (Hybrid implementation)
-    const delegatorSmartAccount = await toMetaMaskSmartAccount({
+    const userSmartAccount = await toMetaMaskSmartAccount({
         client: publicClient,
         implementation: Implementation.Hybrid,
         deployParams: [localAccount.address, [], [], []],
         deploySalt: "0x",
         signatory: { account: localAccount }
     });
-    console.log('Delegator Smart Account created:', delegatorSmartAccount.address);
+    console.log('User Smart Account created:', userSmartAccount.address);
 
     // Create delegatee account (MultiSig implementation)
     const signers = [walletClientAccount1.address, walletClientAccount2.address];
@@ -220,25 +220,25 @@ async function delegationAndRedeem({
         { account: walletClientAccount1 },
         { account: walletClientAccount2 }
     ];
-    const delegateeSmartAccount = await toMetaMaskSmartAccount({
+    const multisigSmartAccount = await toMetaMaskSmartAccount({
         client: publicClient,
         implementation: Implementation.MultiSig,
         deployParams: [signers, threshold],
         deploySalt: "0x",
         signatory
     });
-    console.log('Delegate Smart Account created:', delegateeSmartAccount.address);
+    console.log('Multisig Smart Account created:', multisigSmartAccount.address);
 
     // Create delegation from delegator to delegatee
     const delegation = createDelegation({
-        to: delegateeSmartAccount.address,
-        from: delegatorSmartAccount.address,
+        to: multisigSmartAccount.address,
+        from: userSmartAccount.address,
         caveats: []
     });
     console.log('Delegation created:', JSON.stringify(delegation, null, 2));
 
     // Sign the delegation
-    const signature = await delegatorSmartAccount.signDelegation({ delegation });
+    const signature = await userSmartAccount.signDelegation({ delegation });
     const signedDelegation = { ...delegation, signature };
 
     // Encode the redeem delegation call with empty execution
@@ -255,10 +255,10 @@ async function delegationAndRedeem({
 
     // Send user operation to redeem delegation
     const userOperation = await bundlerClient.prepareUserOperation({
-        account: delegateeSmartAccount,
+        account: multisigSmartAccount,
         calls: [
             {
-                to: delegatorSmartAccount.address,
+                to: userSmartAccount.address,
                 data: redeemDelegationCalldata
             }
         ],
@@ -270,7 +270,7 @@ async function delegationAndRedeem({
             { walletClient: walletClient1, account: walletClientAccount1 },
             { walletClient: walletClient2, account: walletClientAccount2 }
         ],
-        delegateeSmartAccount
+        multisigSmartAccount
     );
     const signedUserOperation = {
         ...userOperation,
@@ -282,11 +282,11 @@ async function delegationAndRedeem({
     const receipt = await bundlerClient.waitForUserOperationReceipt({
         hash: userOpHash,
         pollingInterval: 1000,
-        retryCount: 10
+        retryCount: 100
     });
     console.log('Redemption transaction hash:', receipt.receipt.transactionHash);
     console.log('View on Etherscan:', `https://sepolia.etherscan.io/tx/${receipt.receipt.transactionHash}`);
-    return { delegatorSmartAccount, delegateeSmartAccount, signedDelegation };
+    return { userSmartAccount, multisigSmartAccount, signedDelegation };
 }
 
 // === 3. FUNDING & RETURNING ===
@@ -295,8 +295,8 @@ async function delegationAndRedeem({
  */
 async function fundingAndReturning({
     provider,
-    delegatorSmartAccount,
-    delegateeSmartAccount,
+    userSmartAccount,
+    multisigSmartAccount,
     signedDelegation,
     localAccount,
     bundlerClient,
@@ -308,19 +308,16 @@ async function fundingAndReturning({
 }: any) {
     console.log('\n--- FUNDING & RETURNING ---');
     // Log balance before funding
-    await logBalance('Delegator (before funding)', provider, delegatorSmartAccount.address);
+    await logBalance('User Smart Account (before funding)', provider, userSmartAccount.address);
     // Fund the delegator smart account
-    console.log('Funding the AA wallet...');
+    console.log('Funding the User Smart Account wallet...');
     await fundAAWallet(
         provider,
-        delegatorSmartAccount.address,
+        userSmartAccount.address,
         parseEther('0.001')
     );
     // Log balance after funding
-    await logBalance('Delegator (after funding)', provider, delegatorSmartAccount.address);
-
-    // Return funds through delegation
-    await logBalance('Delegator (before return)', provider, delegatorSmartAccount.address);
+    await logBalance('User Smart Account (after funding)', provider, userSmartAccount.address);
     console.log('Returning funds through delegation...');
     const encodedCall = encodeFunctionData({
         abi: [{
@@ -338,7 +335,7 @@ async function fundingAndReturning({
         args: [localAccount.address, parseEther('0.001'), '0x'],
     });
     const executions = [{
-        target: delegatorSmartAccount.address,
+        target: userSmartAccount.address,
         value: 0n, // The Hybrid delegator sends, not the Delegatee
         callData: encodedCall
     }];
@@ -349,10 +346,10 @@ async function fundingAndReturning({
     });
     const { fast: newFees } = await pimlicoClient.getUserOperationGasPrice();
     const returnFundsUserOp = await bundlerClient.prepareUserOperation({
-      account: delegateeSmartAccount,
+      account: multisigSmartAccount,
       calls: [
         {
-          to: delegatorSmartAccount.address,
+          to: userSmartAccount.address,
           data: returnFundsCalldata
         }
       ],
@@ -365,7 +362,7 @@ async function fundingAndReturning({
         { walletClient: walletClient1, account: walletClientAccount1 },
         { walletClient: walletClient2, account: walletClientAccount2 }
       ],
-      delegateeSmartAccount
+      multisigSmartAccount
     );
     console.log('Return funds user operation sent!');
     const userOpHash = await bundlerClient.sendUserOperation({
@@ -377,12 +374,12 @@ async function fundingAndReturning({
     const receipt = await bundlerClient.waitForUserOperationReceipt({
         hash: userOpHash,
         pollingInterval: 1000,
-        retryCount: 10
+        retryCount: 100
     });
     console.log('Return funds transaction hash:', receipt.receipt.transactionHash);
     console.log('View on Etherscan:', `https://sepolia.etherscan.io/tx/${receipt.receipt.transactionHash}`);
     // Log balance after return
-    await logBalance('Delegator (after return)', provider, delegatorSmartAccount.address);
+    await logBalance('User Smart Account (after return)', provider, userSmartAccount.address);
 
 }
 
@@ -390,11 +387,11 @@ async function fundingAndReturning({
 (async function main() {
     try {
         const setupResult = await setup();
-        const { delegatorSmartAccount, delegateeSmartAccount, signedDelegation } = await delegationAndRedeem(setupResult);
+        const { userSmartAccount, multisigSmartAccount, signedDelegation } = await delegationAndRedeem(setupResult);
         await fundingAndReturning({
             ...setupResult,
-            delegatorSmartAccount,
-            delegateeSmartAccount,
+            userSmartAccount,
+            multisigSmartAccount,
             signedDelegation
         });
         console.log('\nAll done!');
