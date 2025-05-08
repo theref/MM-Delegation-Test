@@ -282,7 +282,7 @@ async function fundingAndReturning({
       account: multisigSmartAccount,
       calls: [
         {
-          to: userSmartAccount.address,
+          to: multisigSmartAccount.address,
           data: returnFundsCalldata
         }
       ],
