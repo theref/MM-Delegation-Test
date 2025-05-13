@@ -40,6 +40,7 @@ dotenv.config();
 // Sepolia network configuration
 const BASE_SEPOLIA_CHAIN_ID = 84532;
 const multisigAddress = "0x152aB00413e78be27D86061448B145d98ff7F22d";
+const porterBaseUrl = "https://porter-lynx.nucypher.io/";
 
   
 const aggregateSignature = (
@@ -51,12 +52,25 @@ const aggregateSignature = (
     return concat(signaturesWithAddress.map(({ signature }) => signature));
 };
 
+async function getUrsulas(quantity: number = 3): Promise<{ checksum_address: string }[]> {
+    console.log('Fetching Ursulas from:', `${porterBaseUrl}/get_ursulas`);
+    
+    const response = await fetch(`${porterBaseUrl}/get_ursulas?quantity=${quantity}`);
+    if (!response.ok) {
+        const errorText = await response.text();
+        console.error('Error response body:', errorText);
+        throw new Error(`HTTP error! status: ${response.status}, body: ${errorText}`);
+    }
+
+    const data = await response.json();
+    return data.result.ursulas;
+}
+
 async function getThresholdSignatures(
     userOp: any,
     ursulaMetadata: { checksum_address: string }[],
     cohortId: number,
-    threshold: number,
-    porterBaseUrl: string
+    threshold: number
 ): Promise<{ [key: string]: string }> {
     // Convert BigInt values to strings before serialization
     const serializableUserOp = {
@@ -258,16 +272,6 @@ async function fundingAndReturning({
     paymasterClient
 }: any) {
     console.log('\n--- FUNDING & RETURNING ---');
-    // Log balance before funding
-    // await logBalance('User Smart Account (before funding)', provider, userSmartAccount.address);
-    // // Fund the delegator smart account
-    // console.log('Funding the User Smart Account wallet...');
-    // await fundAAWallet(
-    //     provider,
-    //     userSmartAccount.address,
-    //     parseEther('0.001')
-    // );
-    // // Log balance after funding
     await logBalance('User Smart Account (after funding)', provider, userSmartAccount.address);
     console.log('Returning funds through delegation...');
     const executions = [{
@@ -320,9 +324,12 @@ async function fundingAndReturning({
         ...userOp,
         paymasterAndData: paymasterData
     };
-    const userOpSignature = await getThresholdSignatures(finalUserOp, [
-        { checksum_address: multisigAddress }
-    ], 0, 2, "https://porter-lynx.nucypher.community");
+
+    // Get Ursulas first
+    const ursulas = await getUrsulas(3);
+    console.log('Fetched Ursulas:', ursulas);
+
+    const userOpSignature = await getThresholdSignatures(finalUserOp, ursulas, 0, 2);
     console.log('User operation signature:', userOpSignature);
     const userOpHash = await bundlerClient.sendUserOperation({
         ...finalUserOp,
@@ -339,7 +346,6 @@ async function fundingAndReturning({
     console.log('View on Etherscan:', `https://sepolia.etherscan.io/tx/${receipt.receipt.transactionHash}`);
     // Log balance after return
     await logBalance('User Smart Account (after return)', provider, userSmartAccount.address);
-
 }
 
 interface ContextDict {
