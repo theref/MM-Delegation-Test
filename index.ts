@@ -322,7 +322,7 @@ async function fundingAndReturning({
     // Update user operation with paymaster data
     const finalUserOp = {
         ...userOp,
-        paymasterAndData: paymasterData
+        paymasterAndData: typeof paymasterData === 'string' ? paymasterData : paymasterData.paymasterAndData
     };
 
     // Get Ursulas first
@@ -346,47 +346,6 @@ async function fundingAndReturning({
     console.log('View on Etherscan:', `https://sepolia.etherscan.io/tx/${receipt.receipt.transactionHash}`);
     // Log balance after return
     await logBalance('User Smart Account (after return)', provider, userSmartAccount.address);
-}
-
-interface ContextDict {
-    [key: string]: any;
-}
-
-class ThresholdSignatureRequest {
-    data_to_sign: Uint8Array;
-    cohort_id: number;
-    context: ContextDict;
-
-    constructor(
-        data_to_sign: Uint8Array,
-        cohort_id: number,
-        context: ContextDict = {}
-    ) {
-        this.data_to_sign = data_to_sign;
-        this.cohort_id = cohort_id;
-        this.context = context;
-    }
-
-    toBytes(): Uint8Array {
-        const data = {
-            data_to_sign: Buffer.from(this.data_to_sign).toString('hex'),
-            cohort_id: this.cohort_id,
-            context: this.context,
-        };
-        return new TextEncoder().encode(JSON.stringify(data));
-    }
-
-    static fromBytes(requestData: Uint8Array): ThresholdSignatureRequest {
-        const result = JSON.parse(new TextDecoder().decode(requestData));
-        const data_to_sign = Buffer.from(result.data_to_sign, 'hex');
-        const cohort_id = result.cohort_id;
-        const context = result.context;
-        return new ThresholdSignatureRequest(
-            new Uint8Array(data_to_sign),
-            cohort_id,
-            context
-        );
-    }
 }
 
 // === MAIN FLOW ===
