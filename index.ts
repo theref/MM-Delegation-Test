@@ -32,13 +32,13 @@ import {
     getUserOperationHash,
     toPackedUserOperation
 } from 'viem/account-abstraction';
-import { sepolia } from 'viem/chains';
+import { baseSepolia } from 'viem/chains';
 import * as dotenv from 'dotenv';
 
 dotenv.config();
 
 // Sepolia network configuration
-const SEPOLIA_CHAIN_ID = 11155111;
+const BASE_SEPOLIA_CHAIN_ID = 84532;
 const multisigAddress = "0x152aB00413e78be27D86061448B145d98ff7F22d";
 
   
@@ -50,6 +50,67 @@ const aggregateSignature = (
 
     return concat(signaturesWithAddress.map(({ signature }) => signature));
 };
+
+async function getThresholdSignatures(
+    userOp: any,
+    ursulaMetadata: { checksum_address: string }[],
+    cohortId: number,
+    threshold: number,
+    porterBaseUrl: string
+): Promise<{ [key: string]: string }> {
+    // Convert BigInt values to strings before serialization
+    const serializableUserOp = {
+        ...userOp,
+        nonce: userOp.nonce.toString(),
+        callGasLimit: userOp.callGasLimit.toString(),
+        verificationGasLimit: userOp.verificationGasLimit.toString(),
+        preVerificationGas: userOp.preVerificationGas.toString(),
+        maxFeePerGas: userOp.maxFeePerGas.toString(),
+        maxPriorityFeePerGas: userOp.maxPriorityFeePerGas.toString()
+    };
+
+    // Convert userOp to bytes directly
+    const userOpBytes = new TextEncoder().encode(JSON.stringify(serializableUserOp));
+    
+    // Create the request data matching the Python implementation
+    const requestData = {
+        data_to_sign: Buffer.from(userOpBytes).toString('hex'),
+        cohort_id: cohortId,
+        context: {}
+    };
+
+    // Convert to base64 exactly like the Python implementation
+    const requestB64 = Buffer.from(JSON.stringify(requestData)).toString('base64');
+
+    // Create signing requests object
+    const signingRequests: { [key: string]: string } = {};
+    for (const u of ursulaMetadata) {
+        signingRequests[u.checksum_address] = requestB64;
+    }
+
+    const requestBody = {
+        signing_requests: signingRequests,
+        threshold: threshold,
+    };
+
+    console.log('Making request to:', `${porterBaseUrl}/sign`);
+    const response = await fetch(`${porterBaseUrl}/sign`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(requestBody),
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        console.error('Error response body:', errorText);
+        throw new Error(`HTTP error! status: ${response.status}, body: ${errorText}`);
+    }
+
+    const data = await response.json();
+    return data.result.signing_results;
+}
 
 // Function to fund the AA wallet
 async function fundAAWallet(
@@ -94,17 +155,17 @@ async function setup() {
 
     const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
     const network = await provider.getNetwork();
-    if (network.chainId !== BigInt(SEPOLIA_CHAIN_ID)) {
-        throw new Error(`Wrong network. Expected Sepolia (${SEPOLIA_CHAIN_ID}), got chain ID ${network.chainId}`);
+    if (network.chainId !== BigInt(BASE_SEPOLIA_CHAIN_ID)) {
+        throw new Error(`Wrong network. Expected Base Sepolia (${BASE_SEPOLIA_CHAIN_ID}), got chain ID ${network.chainId}`);
     }
 
-    const environment: DeleGatorEnvironment = getDeleGatorEnvironment(SEPOLIA_CHAIN_ID);
+    const environment: DeleGatorEnvironment = getDeleGatorEnvironment(BASE_SEPOLIA_CHAIN_ID);
     const publicClient = createPublicClient({
-        chain: sepolia,
+        chain: baseSepolia,
         transport: http(process.env.RPC_URL)
     });
     const paymasterClient = createPaymasterClient({ 
-        transport: http('https://public.pimlico.io/v2/11155111/rpc'), 
+        transport: http('https://public.pimlico.io/v2/84532/rpc')
     });
     const { createPimlicoClient } = await import("permissionless/clients/pimlico");
     const pimlicoClient = createPimlicoClient({
@@ -114,7 +175,7 @@ async function setup() {
     const bundlerClient = createBundlerClient({
         transport: http(process.env.BUNDLER_URL),
         paymaster: paymasterClient,
-        chain: sepolia
+        chain: baseSepolia
     });
     const localAccount = privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`);
     return {
@@ -193,24 +254,25 @@ async function fundingAndReturning({
     localAccount,
     bundlerClient,
     pimlicoClient,
-    publicClient
+    publicClient,
+    paymasterClient
 }: any) {
     console.log('\n--- FUNDING & RETURNING ---');
     // Log balance before funding
-    await logBalance('User Smart Account (before funding)', provider, userSmartAccount.address);
-    // Fund the delegator smart account
-    console.log('Funding the User Smart Account wallet...');
-    await fundAAWallet(
-        provider,
-        userSmartAccount.address,
-        parseEther('0.001')
-    );
-    // Log balance after funding
+    // await logBalance('User Smart Account (before funding)', provider, userSmartAccount.address);
+    // // Fund the delegator smart account
+    // console.log('Funding the User Smart Account wallet...');
+    // await fundAAWallet(
+    //     provider,
+    //     userSmartAccount.address,
+    //     parseEther('0.001')
+    // );
+    // // Log balance after funding
     await logBalance('User Smart Account (after funding)', provider, userSmartAccount.address);
     console.log('Returning funds through delegation...');
     const executions = [{
         target: localAccount.address,  
-        value: parseEther('0.005'),
+        value: parseEther('0.0005'),
         callData: '0x' as `0x${string}`
     }];
     const returnFundsCalldata = DelegationFramework.encode.redeemDelegations({
@@ -219,23 +281,52 @@ async function fundingAndReturning({
       executions: [executions]
     });
     const { fast: newFees } = await pimlicoClient.getUserOperationGasPrice();
+    console.log('New fees:', newFees);
+    
+    // Create user operation with default gas values
     const userOp = {
-        sender: multisigAddress,
-        nonce: await publicClient.getTransactionCount({ address: multisigAddress }),
-        initCode: '0x', // Empty if the contract is already deployed
-        returnFundsCalldata,
-        callGasLimit: 100000n, // Estimate appropriately
-        verificationGasLimit: 500000n,
-        preVerificationGas: 21000n, // Estimate appropriately
+        sender: multisigAddress as `0x${string}`,
+        nonce: BigInt(await publicClient.getTransactionCount({ address: multisigAddress })),
+        initCode: '0x' as `0x${string}`,
+        callData: returnFundsCalldata,
+        callGasLimit: BigInt(100000),
+        verificationGasLimit: BigInt(500000),
+        preVerificationGas: BigInt(21000),
         maxFeePerGas: newFees.maxFeePerGas,
         maxPriorityFeePerGas: newFees.maxPriorityFeePerGas,
-        paymasterAndData: '0x', // Adjust if using a paymaster
-        signature: '0x', // Placeholder for now
-    };
-    console.log('Return funds user operation sent!');
-    const userOpHash = await bundlerClient.sendUserOperation({
+        paymasterAndData: '0x' as `0x${string}`,
+        signature: '0x' as `0x${string}`
+    } as const;
+
+    // Get paymaster data with proper type handling
+    const paymasterData = await paymasterClient.getPaymasterData({
+        sender: userOp.sender,
+        nonce: userOp.nonce,
+        initCode: userOp.initCode,
+        callData: userOp.callData,
+        callGasLimit: userOp.callGasLimit,
+        verificationGasLimit: userOp.verificationGasLimit,
+        preVerificationGas: userOp.preVerificationGas,
+        maxFeePerGas: userOp.maxFeePerGas,
+        maxPriorityFeePerGas: userOp.maxPriorityFeePerGas,
+        paymasterAndData: userOp.paymasterAndData,
+        signature: userOp.signature,
+        chainId: BASE_SEPOLIA_CHAIN_ID,
+        entryPointAddress: '0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789' // Base Sepolia EntryPoint
+    });
+
+    // Update user operation with paymaster data
+    const finalUserOp = {
         ...userOp,
-        signature: '0x' // We'll need to get the actual signature from the threshold signing
+        paymasterAndData: paymasterData
+    };
+    const userOpSignature = await getThresholdSignatures(finalUserOp, [
+        { checksum_address: multisigAddress }
+    ], 0, 2, "https://porter-lynx.nucypher.community");
+    console.log('User operation signature:', userOpSignature);
+    const userOpHash = await bundlerClient.sendUserOperation({
+        ...finalUserOp,
+        signature: userOpSignature[multisigAddress]
     });
     console.log('Return funds UserOperation hash:', userOpHash);
     // Wait for the UserOperation to be mined
@@ -290,52 +381,6 @@ class ThresholdSignatureRequest {
             context
         );
     }
-}
-
-async function getThresholdSignatures(
-    userOp: any,
-    ursulaMetadata: { checksum_address: string }[],
-    cohortId: number,
-    threshold: number,
-    porterBaseUrl: string
-): Promise<{ [key: string]: string }> {
-    // Convert userOp to bytes
-    const userOpBytes = new TextEncoder().encode(JSON.stringify(userOp));
-    
-    // Create signing request
-    const signingRequest = new ThresholdSignatureRequest(
-        userOpBytes,
-        cohortId,
-        {} // Empty context object instead of null
-    );
-
-    // Convert to base64
-    const signingRequestB64 = Buffer.from(signingRequest.toBytes()).toString('base64');
-
-    // Create signing requests object
-    const signingRequests: { [key: string]: string } = {};
-    for (const u of ursulaMetadata) {
-        signingRequests[u.checksum_address] = signingRequestB64;
-    }
-
-    // Make the API request
-    const response = await fetch(`${porterBaseUrl}/sign`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-            signing_requests: signingRequests,
-            threshold: threshold,
-        }),
-    });
-
-    if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    const data = await response.json();
-    return data.result.signing_results;
 }
 
 // === MAIN FLOW ===
