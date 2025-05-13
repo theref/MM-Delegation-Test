@@ -39,55 +39,17 @@ dotenv.config();
 
 // Sepolia network configuration
 const SEPOLIA_CHAIN_ID = 11155111;
+const multisigAddress = "0x152aB00413e78be27D86061448B145d98ff7F22d";
 
-
-const signUserOperation = async (params: SignUserOperationParams, owner: WalletClient, smartAccount: MetaMaskSmartAccount) => {
-    const { chainId } = params;
-  
-    const packedUserOp = toPackedUserOperation({
-      sender: smartAccount.address,
-      ...params,
-    });
-  
-    const signature = await owner.signTypedData({
-      account: owner.account!,
-      domain: {
-        chainId: chainId || sepolia.id,
-        // This should be HyridDeleGator for Implementation.hybrid
-        name: 'MultiSigDeleGator',
-        version: '1',
-        verifyingContract: smartAccount.address,
-      },
-      types: SIGNABLE_USER_OP_TYPED_DATA,
-      primaryType: 'PackedUserOperation',
-      message: { ...packedUserOp, entryPoint: smartAccount.entryPoint.address as `0x${string}` },
-    });
-  
-    return signature;
-};
   
 const aggregateSignature = (
     signaturesWithAddress: { signature: Hex; address: Address }[],
-  ) => {
+) => {
     // signatures need to be sorted by address!
     signaturesWithAddress.sort((a, b) => a.address.localeCompare(b.address));
-  
+
     return concat(signaturesWithAddress.map(({ signature }) => signature));
 };
-
-// Helper function to sign a user operation with multiple signers and aggregate the signatures
-async function signUserOperationWithMultisig(
-    userOperation: any,
-    signers: { walletClient: WalletClient, account: any }[],
-    smartAccount: MetaMaskSmartAccount
-): Promise<Hex> {
-    const signaturesWithAddress = [];
-    for (const { walletClient, account } of signers) {
-        const signature = await signUserOperation(userOperation, walletClient, smartAccount);
-        signaturesWithAddress.push({ signature, address: account.address });
-    }
-    return aggregateSignature(signaturesWithAddress);
-}
 
 // Function to fund the AA wallet
 async function fundAAWallet(
@@ -155,20 +117,6 @@ async function setup() {
         chain: sepolia
     });
     const localAccount = privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`);
-    const walletClientPivatekey1 = generatePrivateKey(); 
-    const walletClientAccount1 = privateKeyToAccount(walletClientPivatekey1);
-    const walletClientPivatekey2 = generatePrivateKey(); 
-    const walletClientAccount2 = privateKeyToAccount(walletClientPivatekey2);
-    const walletClient1 = createWalletClient({
-        account: walletClientAccount1,
-        chain: sepolia,
-        transport: http(process.env.RPC_URL)
-    });
-    const walletClient2 = createWalletClient({
-        account: walletClientAccount2,
-        chain: sepolia,
-        transport: http(process.env.RPC_URL)
-    });
     return {
         provider,
         environment,
@@ -178,10 +126,6 @@ async function setup() {
         fees,
         bundlerClient,
         localAccount,
-        walletClientAccount1,
-        walletClientAccount2,
-        walletClient1,
-        walletClient2
     };
 }
 
@@ -193,8 +137,6 @@ async function setup() {
 async function Delegate({
     publicClient,
     localAccount,
-    walletClientAccount1,
-    walletClientAccount2,
     pimlicoClient,
     bundlerClient,
     paymasterClient
@@ -226,25 +168,9 @@ async function Delegate({
     });
     console.log('User Smart Account created:', userSmartAccount.address);
 
-    // Create delegatee account (MultiSig implementation)
-    const signers = [walletClientAccount1.address, walletClientAccount2.address];
-    const threshold = BigInt(2);
-    const signatory = [
-        { account: walletClientAccount1 },
-        { account: walletClientAccount2 }
-    ];
-    const multisigSmartAccount = await toMetaMaskSmartAccount({
-        client: publicClient,
-        implementation: Implementation.MultiSig,
-        deployParams: [signers, threshold],
-        deploySalt: "0x",
-        signatory
-    });
-    console.log('Multisig Smart Account created:', multisigSmartAccount.address);
-
     // Create delegation from delegator to delegatee
     const delegation = createDelegation({
-        to: multisigSmartAccount.address,
+        to: multisigAddress,
         from: userSmartAccount.address,
         caveats: []
     });
@@ -253,7 +179,7 @@ async function Delegate({
     // Sign the delegation
     const signature = await userSmartAccount.signDelegation({ delegation });
     const signedDelegation = { ...delegation, signature };
-    return { userSmartAccount, multisigSmartAccount, signedDelegation };
+    return { userSmartAccount, signedDelegation };
 }
 
 // === 3. FUNDING & RETURNING ===
@@ -263,15 +189,11 @@ async function Delegate({
 async function fundingAndReturning({
     provider,
     userSmartAccount,
-    multisigSmartAccount,
     signedDelegation,
     localAccount,
     bundlerClient,
-    walletClient1,
-    walletClient2,
-    walletClientAccount1,
-    walletClientAccount2,
-    pimlicoClient
+    pimlicoClient,
+    publicClient
 }: any) {
     console.log('\n--- FUNDING & RETURNING ---');
     // Log balance before funding
@@ -297,29 +219,23 @@ async function fundingAndReturning({
       executions: [executions]
     });
     const { fast: newFees } = await pimlicoClient.getUserOperationGasPrice();
-    const returnFundsUserOp = await bundlerClient.prepareUserOperation({
-      account: multisigSmartAccount,
-      calls: [
-        {
-          to: multisigSmartAccount.address,
-          data: returnFundsCalldata
-        }
-      ],
-      verificationGasLimit: BigInt(500_000),
-      ...newFees
-    });
-    const returnFundsSig = await signUserOperationWithMultisig(
-      returnFundsUserOp,
-      [
-        { walletClient: walletClient1, account: walletClientAccount1 },
-        { walletClient: walletClient2, account: walletClientAccount2 }
-      ],
-      multisigSmartAccount
-    );
+    const userOp = {
+        sender: multisigAddress,
+        nonce: await publicClient.getTransactionCount({ address: multisigAddress }),
+        initCode: '0x', // Empty if the contract is already deployed
+        returnFundsCalldata,
+        callGasLimit: 100000n, // Estimate appropriately
+        verificationGasLimit: 500000n,
+        preVerificationGas: 21000n, // Estimate appropriately
+        maxFeePerGas: newFees.maxFeePerGas,
+        maxPriorityFeePerGas: newFees.maxPriorityFeePerGas,
+        paymasterAndData: '0x', // Adjust if using a paymaster
+        signature: '0x', // Placeholder for now
+    };
     console.log('Return funds user operation sent!');
     const userOpHash = await bundlerClient.sendUserOperation({
-      ...returnFundsUserOp,
-      signature: returnFundsSig
+        ...userOp,
+        signature: '0x' // We'll need to get the actual signature from the threshold signing
     });
     console.log('Return funds UserOperation hash:', userOpHash);
     // Wait for the UserOperation to be mined
@@ -335,15 +251,101 @@ async function fundingAndReturning({
 
 }
 
+interface ContextDict {
+    [key: string]: any;
+}
+
+class ThresholdSignatureRequest {
+    data_to_sign: Uint8Array;
+    cohort_id: number;
+    context: ContextDict;
+
+    constructor(
+        data_to_sign: Uint8Array,
+        cohort_id: number,
+        context: ContextDict = {}
+    ) {
+        this.data_to_sign = data_to_sign;
+        this.cohort_id = cohort_id;
+        this.context = context;
+    }
+
+    toBytes(): Uint8Array {
+        const data = {
+            data_to_sign: Buffer.from(this.data_to_sign).toString('hex'),
+            cohort_id: this.cohort_id,
+            context: this.context,
+        };
+        return new TextEncoder().encode(JSON.stringify(data));
+    }
+
+    static fromBytes(requestData: Uint8Array): ThresholdSignatureRequest {
+        const result = JSON.parse(new TextDecoder().decode(requestData));
+        const data_to_sign = Buffer.from(result.data_to_sign, 'hex');
+        const cohort_id = result.cohort_id;
+        const context = result.context;
+        return new ThresholdSignatureRequest(
+            new Uint8Array(data_to_sign),
+            cohort_id,
+            context
+        );
+    }
+}
+
+async function getThresholdSignatures(
+    userOp: any,
+    ursulaMetadata: { checksum_address: string }[],
+    cohortId: number,
+    threshold: number,
+    porterBaseUrl: string
+): Promise<{ [key: string]: string }> {
+    // Convert userOp to bytes
+    const userOpBytes = new TextEncoder().encode(JSON.stringify(userOp));
+    
+    // Create signing request
+    const signingRequest = new ThresholdSignatureRequest(
+        userOpBytes,
+        cohortId,
+        {} // Empty context object instead of null
+    );
+
+    // Convert to base64
+    const signingRequestB64 = Buffer.from(signingRequest.toBytes()).toString('base64');
+
+    // Create signing requests object
+    const signingRequests: { [key: string]: string } = {};
+    for (const u of ursulaMetadata) {
+        signingRequests[u.checksum_address] = signingRequestB64;
+    }
+
+    // Make the API request
+    const response = await fetch(`${porterBaseUrl}/sign`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            signing_requests: signingRequests,
+            threshold: threshold,
+        }),
+    });
+
+    if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const data = await response.json();
+    return data.result.signing_results;
+}
+
 // === MAIN FLOW ===
 (async function main() {
     try {
         const setupResult = await setup();
-        const { userSmartAccount, multisigSmartAccount, signedDelegation } = await Delegate(setupResult);
+        const { userSmartAccount, signedDelegation } = await Delegate(setupResult);
         await fundingAndReturning({
             ...setupResult,
             userSmartAccount,
-            multisigSmartAccount,
             signedDelegation
         });
         console.log('\nAll done!');
