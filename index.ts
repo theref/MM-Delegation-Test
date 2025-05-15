@@ -24,7 +24,7 @@ import {
     SIGNABLE_USER_OP_TYPED_DATA
 } from '@metamask/delegation-toolkit';
 import { ethers, TypedDataDomain as EthersTypedDataDomain, TypedDataField, TypedDataEncoder } from 'ethers';
-import { Address, concat, createPublicClient, createWalletClient, encodeFunctionData, Hex, http, parseEther, WalletClient, zeroAddress, hashTypedData, TypedDataDomain as ViemTypedDataDomain, recoverMessageAddress, hashMessage, recoverAddress } from 'viem';
+import { Address, concat, createPublicClient, createWalletClient, encodeFunctionData, Hex, toHex, http, parseEther, WalletClient, zeroAddress, hashTypedData, TypedDataDomain as ViemTypedDataDomain, recoverMessageAddress, hashMessage, recoverAddress, keccak256, fromHex } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { 
     createPaymasterClient,
@@ -286,10 +286,9 @@ async function Delegate({
 async function getThresholdSignatures(
     userOp: UserOperation,
     multisigSmartAccount: MetaMaskSmartAccount,
-    ursulaChecksumsForRequest: `0x${string}`[], // Renamed to avoid confusion with global
-    cohortId: number,
+    ursulaChecksumsForRequest: `0x${string}`[],
     porterThreshold: number
-): Promise<{ porterSignatures: { [checksumAddress: string]: [string, string] }; signedDigest: Hex; porterClaimedSigners: Address[] }> {
+): Promise<{ porterSignatures: { [checksumAddress: string]: [string, string] }; digestToVerify: Hex; porterClaimedSigners: Address[] }> {
     const packedUserOp = toPackedUserOperation(userOp);
 
     const viemDomain: ViemTypedDataDomain = {
@@ -319,33 +318,30 @@ async function getThresholdSignatures(
         PackedUserOperation: metamaskToolkitTypes.PackedUserOperation.map(f => ({ name: f.name, type: f.type }))
     };
 
-    let finalEip712Digest: Hex;
-    try {
-        finalEip712Digest = await getEIP712EncodedPayloadEthers(
-            ethersDomain,
-            ethersTypes,
-            messageForSigning
-        ) as Hex;
-        logger.info(`Final EIP-712 Digest (0x1901... hash, from TypedDataEncoder.encode): ${finalEip712Digest}`);
-        logger.info(`This digest will be sent to Porter as data_to_sign and used for all verifications.`);
-    } catch (e: any) {
-        logger.error("Error getting EIP-712 encoded payload with ethers: ", e.message);
-        throw new Error(`Failed to generate EIP-712 payload for Porter: ${e.message}`);
-    }
+    const finalEip712EncodedPayload = await getEIP712EncodedPayloadEthers(
+        ethersDomain,
+        ethersTypes,
+        messageForSigning
+    );
+    logger.info(`Encoded Payload: ${finalEip712EncodedPayload}`);
 
+    // To mimic sign_test.ts: convert the hex payload to string, then hashMessage that string.
+
+    const payloadAsHex = toHex(finalEip712EncodedPayload);
+    logger.info(`Payload as Hex: ${payloadAsHex}`);
+    
+    const digestForVerification = hashMessage(finalEip712EncodedPayload);
     // Use library function to get signatures from Porter
     const { signatures: receivedPorterSignatures, claimedSigners: porterClaimedSigners } = await requestSignaturesFromPorter(
-        porterBaseUrl, // Global const for Porter base URL
-        finalEip712Digest, // This is the data Porter needs to sign
+        porterBaseUrl,
+        payloadAsHex, // Send the full encoded payload (0x1901...) to Porter
         ursulaChecksumsForRequest,
         porterThreshold,
-        cohortId // cohortId is passed through
-        // context can be omitted if default {} is fine
     );
 
     return {
         porterSignatures: receivedPorterSignatures,
-        signedDigest: finalEip712Digest, // This is the EIP-712 hash (0x1901...) that was signed
+        digestToVerify: digestForVerification, // Return the keccak256 hash for verification procedures
         porterClaimedSigners
     };
 }
@@ -409,25 +405,22 @@ async function fundingAndReturning({
       ...newFees
     });
 
-    const { porterSignatures, signedDigest, porterClaimedSigners } = await getThresholdSignatures(
+    const { porterSignatures, digestToVerify, porterClaimedSigners } = await getThresholdSignatures(
         returnFundsUserOp, 
         multisigSmartAccount, 
-        porterChecksums, // Pass the available porterChecksums (Ursulas)
-        0, // cohortId
-        Number(MULTISIG_CONTRACT_THRESHOLD) // porterThreshold
+        porterChecksums,
+        Number(MULTISIG_CONTRACT_THRESHOLD)
     );
-    // Use library function for aggregation
     const combinedSignature = aggregatePorterSignatures(porterSignatures);
 
-    logger.info(`Final EIP-712 Digest (signed by Porter, used for verifications): ${signedDigest}`);
+    logger.info(`Digest for Verification (used for local & on-chain checks): ${digestToVerify}`);
     logger.info(`Combined Signature: ${combinedSignature}`);
     logger.info(`Porter claimed signers for this op: ${porterClaimedSigners.join(', ')}`);
 
-    // Use library function for on-chain verification
     const isOnChainValid = await verifySignaturesOnChainViaEIP1271(
         provider, 
-        multisigSmartAccount.address, 
-        signedDigest,   // Use the final EIP-712 digest (0x1901...)
+        multisigSmartAccount.address,
+        digestToVerify,   // Use the keccak256 hash of the EIP-712 encoded payload
         combinedSignature
     );
 
@@ -436,13 +429,12 @@ async function fundingAndReturning({
         logger.error('CRITICAL: Programmatic ON-CHAIN verification returned INVALID (as per library). ');
     }
 
-    logger.info('Attempting local verification (verifying EIP-712 digest against Porter claimed signers)...');
-    // Use library function for local verification
+    logger.info('Attempting local verification (verifying digest against Porter claimed signers)...');
     const isSignatureLocallyValid = await verifySignaturesLocally(
-        signedDigest, // Use the final EIP-712 digest (0x1901...)
+        digestToVerify, // Use the keccak256 hash of the EIP-712 encoded payload
         combinedSignature,
-        MULTISIG_CONTRACT_THRESHOLD, // The contract's threshold for required valid signatures
-        porterClaimedSigners, // IMPORTANT: Use signers claimed by Porter for this set of sigs
+        MULTISIG_CONTRACT_THRESHOLD, 
+        porterClaimedSigners,
     );
 
     if (!isSignatureLocallyValid ) {
@@ -475,7 +467,7 @@ async function fundingAndReturning({
     try {
         const setupResult = await setup();
         const { userSmartAccount, multisigSmartAccount, signedDelegation } = await Delegate(setupResult);
-        await fundAAWallet(setupResult.provider, userSmartAccount.address, parseEther('0.001')); // Fund SA
+        // await fundAAWallet(setupResult.provider, userSmartAccount.address, parseEther('0.001')); // Fund SA
         await logBalance('User Smart Account (before return)', setupResult.provider, userSmartAccount.address);
         await fundingAndReturning({
             ...setupResult,
