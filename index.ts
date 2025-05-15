@@ -317,7 +317,7 @@ async function getThresholdSignatures(
     ursulaChecksums: `0x${string}`[],
     cohortId: number,
     porterThreshold: number
-): Promise<{ porterSignatures: { [checksumAddress: string]: [string, string] }; digestSignedByPorter: string }> {
+): Promise<{ porterSignatures: { [checksumAddress: string]: [string, string] }; signingPayload: string }> {
     const packedUserOp = toPackedUserOperation(userOp);
 
     const viemDomain: ViemTypedDataDomain = {
@@ -401,7 +401,7 @@ async function getThresholdSignatures(
     }
 
     // Return signatures and the original EIP-712 payload that was the basis for data_to_sign
-    return { porterSignatures: data.result.signing_results.signatures, digestSignedByPorter: eip712Payload };
+    return { porterSignatures: data.result.signing_results.signatures, signingPayload: eip712Payload };
 }
 
 // New function for local signature verification
@@ -552,7 +552,7 @@ async function fundingAndReturning({
       ...newFees
     });
 
-    const { porterSignatures, digestSignedByPorter } = await getThresholdSignatures(
+    const { porterSignatures, signingPayload } = await getThresholdSignatures(
         returnFundsUserOp, 
         multisigSmartAccount, 
         porterChecksums, 
@@ -562,8 +562,8 @@ async function fundingAndReturning({
     const combinedSignature = aggregateSignature(porterSignatures);
 
     // For on-chain EIP-1271 verification, the contract expects the EIP-191 hash of the original message.
-    const hashForVerification = hashMessage(digestSignedByPorter);
-    logger.info(`Original EIP-712 Payload (used for local Porter-style signing): ${digestSignedByPorter}`);
+    const hashForVerification = hashMessage(signingPayload);
+    logger.info(`Original EIP-712 Payload (used for local Porter-style signing): ${signingPayload}`);
     logger.info(`EIP-191 Hash (hashMessage) of payload (for on-chain EIP-1271 verification): ${hashForVerification}`);
     logger.info(`Combined Signature: ${combinedSignature}`);
 
