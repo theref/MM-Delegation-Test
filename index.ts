@@ -23,14 +23,15 @@ import {
     MetaMaskSmartAccount,
     SIGNABLE_USER_OP_TYPED_DATA
 } from '@metamask/delegation-toolkit';
-import { ethers } from 'ethers';
-import { Address, concat, createPublicClient, createWalletClient, encodeFunctionData, Hex, http, parseEther, WalletClient, zeroAddress } from 'viem';
+import { ethers, TypedDataDomain as EthersTypedDataDomain, TypedDataField, TypedDataEncoder } from 'ethers';
+import { Address, concat, createPublicClient, createWalletClient, encodeFunctionData, Hex, http, parseEther, WalletClient, zeroAddress, hashTypedData, TypedDataDomain as ViemTypedDataDomain, recoverMessageAddress, hashMessage } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { 
     createPaymasterClient,
     createBundlerClient,
     getUserOperationHash,
-    toPackedUserOperation
+    toPackedUserOperation,
+    type UserOperation
 } from 'viem/account-abstraction';
 import { baseSepolia } from 'viem/chains';
 import * as dotenv from 'dotenv';
@@ -78,6 +79,7 @@ winston.addColors({
 dotenv.config();
 
 const BASE_SEPOLIA_CHAIN_ID = 84532;
+const MULTISIG_CONTRACT_THRESHOLD = 2n; // Define global threshold for the contract
 const multisigAddress = "0x152aB00413e78be27D86061448B145d98ff7F22d";
 const porterBaseUrl = "https://porter-lynx.nucypher.io";
 
@@ -235,7 +237,7 @@ async function Delegate({
     });
     logger.info(`User Smart Account created and deployed at: ${userSmartAccount.address}`);
 
-    const threshold = BigInt(2);
+    const thresholdForContract = MULTISIG_CONTRACT_THRESHOLD; // Use global constant for clarity
     
     // Create wallet clients for each signer
     const walletClients = signers.map((address: `0x${string}`) => createWalletClient({
@@ -247,7 +249,7 @@ async function Delegate({
     const multisigSmartAccount = await toMetaMaskSmartAccount({
         client: publicClient,
         implementation: Implementation.MultiSig,
-        deployParams: [signers, threshold],
+        deployParams: [signers, thresholdForContract],
         signatory: walletClients.map((walletClient: WalletClient) => ({ walletClient })),
         deploySalt: "0x",
     });
@@ -280,8 +282,6 @@ const aggregateSignature = (
             addr1.toLowerCase().localeCompare(addr2.toLowerCase())
         );
 
-    logger.debug(`Sorted signature pairs: ${JSON.stringify(sortedSignaturePairs, null, 2)}`);
-
     // Convert base64 signatures to properly formatted hex signatures
     const sortedHexSignatures = sortedSignaturePairs.map(([_, [__, signature]]) => {
         // Convert base64 to buffer
@@ -312,85 +312,202 @@ const aggregateSignature = (
 };
 
 async function getThresholdSignatures(
-    userOp: any,
+    userOp: UserOperation,
+    multisigSmartAccount: MetaMaskSmartAccount,
     ursulaChecksums: `0x${string}`[],
     cohortId: number,
-    threshold: number
-): Promise<{ [checksumAddress: string]: [string, string] }> {
-    // Deep clone and convert all BigInts to strings and ensure proper hex formatting
-    function convertBigInts(obj: any): any {
-        if (typeof obj === 'bigint') {
-            return obj.toString();
-        }
-        if (typeof obj === 'string' && obj.startsWith('0x')) {
-            // Ensure hex strings have even length by padding with 0 if needed
-            return obj.length % 2 === 1 ? obj + '0' : obj;
-        }
-        if (Array.isArray(obj)) {
-            return obj.map(convertBigInts);
-        }
-        if (obj !== null && typeof obj === 'object') {
-            return Object.fromEntries(
-                Object.entries(obj).map(([key, value]) => [key, convertBigInts(value)])
-            );
-        }
-        return obj;
-    }
+    porterThreshold: number
+): Promise<{ porterSignatures: { [checksumAddress: string]: [string, string] }; payloadData: string }> {
+    const packedUserOp = toPackedUserOperation(userOp);
 
-    // Convert BigInt values to strings and format hex values in the user operation
-    const serializableUserOp = convertBigInts(userOp);
-    logger.debug('UserOp structure:', JSON.stringify(serializableUserOp, null, 2));
-
-    // Convert to hex
-    const hexData = Buffer.from(JSON.stringify(serializableUserOp)).toString('hex');
-    
-    const requestData = {
-        data_to_sign: hexData,
-        cohort_id: cohortId,
-        context: {}
+    const viemDomain: ViemTypedDataDomain = {
+        name: 'MultiSigDeleGator',
+        version: '1',
+        chainId: BigInt(BASE_SEPOLIA_CHAIN_ID),
+        verifyingContract: multisigSmartAccount.address
     };
 
-    // Convert to base64
+    // Note: `types` here is using SIGNABLE_USER_OP_TYPED_DATA from @metamask/delegation-toolkit
+    // Ensure its structure is compatible with ethers.js if primaryType determination becomes an issue.
+    const metamaskToolkitTypes = { ...SIGNABLE_USER_OP_TYPED_DATA } as const;
+
+    // Default EntryPoint v0.6 address, verify if this is correct for your setup
+    const DEFAULT_ENTRY_POINT_ADDRESS = '0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789' as Address;
+
+    const messageForSigning = {
+        ...packedUserOp,
+        entryPoint: DEFAULT_ENTRY_POINT_ADDRESS, 
+        signature: '0x' as Hex
+    };
+
+    // --- Prepare data for EIP-712 payload encoding using ethers.js ---
+    const ethersDomain: EthersTypedDataDomain = {
+        name: viemDomain.name,
+        version: viemDomain.version,
+        chainId: Number(viemDomain.chainId),
+        verifyingContract: viemDomain.verifyingContract,
+    };
+
+    // Map Metamask Toolkit types to ethers.js TypedDataField format
+    const ethersTypes: Record<string, Array<TypedDataField>> = {
+        PackedUserOperation: metamaskToolkitTypes.PackedUserOperation.map(f => ({ name: f.name, type: f.type }))
+    };
+
+    let eip712Payload: string;
+    try {
+        eip712Payload = await getEIP712EncodedPayloadEthers(
+            ethersDomain,
+            ethersTypes, // Contains only PackedUserOperation definition
+            messageForSigning
+        );
+        logger.info(`EIP-712 Encoded Payload (this will be sent to Porter in data_to_sign): ${eip712Payload}`);
+    } catch (e: any) {
+        logger.error("Error getting EIP-712 encoded payload with ethers: ", e.message);
+        throw new Error(`Failed to generate EIP-712 payload for Porter: ${e.message}`);
+    }
+
+    // Send the raw EIP-712 payload string to Porter
+    const requestData = { data_to_sign: eip712Payload, cohort_id: cohortId, context: {} };
     const requestB64 = Buffer.from(JSON.stringify(requestData)).toString('base64');
 
     const signingRequests: { [key: string]: string } = {};
-    for (const address of ursulaChecksums) {
-        signingRequests[address] = requestB64;
+    for (const address of ursulaChecksums) { 
+        if (address && typeof address === 'string') { 
+            signingRequests[address] = requestB64; 
+        } else { 
+            logger.warn('Skipping invalid Ursula address for signing request: ', address); 
+        } 
     }
-
-    const requestBody = {
-        signing_requests: signingRequests,
-        threshold: threshold,
-    };
-
-    // Log request size
-    const requestBodySize = Buffer.from(JSON.stringify(requestBody)).length;
-    logger.verbose(`Request size: ${(requestBodySize / 1024).toFixed(2)} KB`);
-
-    logger.info(`Making request to: ${porterBaseUrl}/sign with ${Object.keys(signingRequests).length} signing requests`);
     
-    const response = await fetch(`${porterBaseUrl}/sign`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(requestBody),
+    const requestBody = { signing_requests: signingRequests, threshold: porterThreshold };
+    const response = await fetch(`${porterBaseUrl}/sign`, { 
+        method: 'POST', 
+        headers: {'Content-Type':'application/json'}, 
+        body: JSON.stringify(requestBody) 
     });
 
-    if (!response.ok) {
-        const errorText = await response.text();
-        logger.error('Error response body:', errorText);
-        throw new Error(`HTTP error! status: ${response.status}, body: ${errorText}`);
+    if (!response.ok) { 
+        const errorText = await response.text(); 
+        logger.error('Porter error response body:', errorText); 
+        throw new Error(`Porter HTTP error! status: ${response.status}, details: ${errorText}`); 
     }
-
+    
     const data = await response.json();
-    logger.debug(`Response data: ${JSON.stringify(data, null, 2)}`);
+    logger.debug(`Response data from Porter: ${JSON.stringify(data, null, 2)}`);
 
-    if (!data.result?.signing_results?.signatures) {
-        throw new Error('Invalid response format from Porter: missing signatures');
+    if (!data.result?.signing_results?.signatures) { 
+        logger.error('Invalid response format from Porter: missing signatures. Response data:', data);
+        throw new Error('Invalid response format from Porter: missing signatures'); 
     }
 
-    return data.result.signing_results.signatures;
+    // Return signatures and hashMessage(eip712Payload)
+    return { porterSignatures: data.result.signing_results.signatures, payloadData: requestB64 };
+}
+
+// New function for local signature verification
+async function localVerifyCombinedSignature({
+    hashToVerify,
+    combinedSignature,
+    contractThreshold, 
+    expectedSigners,
+    signatureLength = SIGNATURE_LENGTH
+}: {
+    hashToVerify: Hex;
+    combinedSignature: Hex;
+    contractThreshold: bigint; 
+    expectedSigners: readonly Address[];
+    signatureLength?: number;
+}): Promise<boolean> {
+    const numSignaturesRequired = Number(contractThreshold);
+
+    // Check 1: Combined signature must have a total length that's a multiple of individual signature lengths.
+    if ((combinedSignature.length - 2) % (signatureLength * 2) !== 0) {
+        return false; 
+    }
+    const actualNumSignatures = (combinedSignature.length - 2) / (signatureLength * 2);
+
+    // Check 2: The number of signatures found must match the required threshold.
+    if (actualNumSignatures >= numSignaturesRequired) {
+        return false;
+    }
+
+    let lastRecoveredSigner: Address = zeroAddress;
+    const recoveredSignersInThisSet = new Set<Address>();
+    const lowerCaseExpectedSigners = expectedSigners.map(s => s.toLowerCase() as Address);
+
+    for (let i = 0; i < numSignaturesRequired; i++) {
+        const sigOffset = 2 + i * signatureLength * 2;
+        const individualSignature = `0x${combinedSignature.substring(sigOffset, sigOffset + signatureLength * 2)}` as Hex;
+
+        try {
+            const recoveredAddress = await recoverMessageAddress({
+                message: { raw: hashToVerify },
+                signature: individualSignature
+            });
+            const lowerCaseRecoveredAddress = recoveredAddress.toLowerCase() as Address;
+
+            // Check 3: Recovered signer must be in the expected list.
+            if (!lowerCaseExpectedSigners.includes(lowerCaseRecoveredAddress)) {
+                return false;
+            }
+
+            // Check 4: Signers must be in strictly ascending order.
+            // This also implies the first recovered address cannot be zeroAddress if lastRecoveredSigner was zeroAddress.
+            if (lowerCaseRecoveredAddress.localeCompare(lastRecoveredSigner) <= 0) {
+                return false;
+            }
+
+            recoveredSignersInThisSet.add(lowerCaseRecoveredAddress);
+            lastRecoveredSigner = lowerCaseRecoveredAddress;
+        } catch (e) {
+            return false; // Error during signature recovery means invalid.
+        }
+    }
+
+    return true; // All checks passed for all required signatures.
+}
+
+// New function for programmatic on-chain EIP-1271 verification
+const EIP1271_MAGIC_VALUE = "0x1626ba7e";
+async function programmaticOnChainVerification(
+    provider: ethers.JsonRpcProvider,
+    contractAddress: Address,
+    hashToVerify: Hex,
+    combinedSignature: Hex
+): Promise<boolean> {
+    logger.info(`--- Verifying on-chain (EIP-1271) sig for contract ${contractAddress}, hash ${hashToVerify} ---`);
+
+    const contractAbi = [
+        "function isValidSignature(bytes32 _hash, bytes _signature) external view returns (bytes4)"
+    ];
+
+    const contract = new ethers.Contract(contractAddress, contractAbi, provider);
+
+    try {
+        const result: string = await contract.isValidSignature(hashToVerify, combinedSignature);
+        logger.debug(`On-chain isValidSignature for ${contractAddress} (hash: ${hashToVerify}) returned: ${result}`);
+        if (result.toLowerCase() === EIP1271_MAGIC_VALUE.toLowerCase()) {
+            logger.info(`SUCCESS: On-chain verification for ${contractAddress} PASSED.`);
+            return true;
+        } else {
+            logger.error(`FAILURE: On-chain verification for ${contractAddress} FAILED. Expected ${EIP1271_MAGIC_VALUE}, got ${result}.`);
+            return false;
+        }
+    } catch (error: any) {
+        logger.error(`ERROR during on-chain verification for ${contractAddress} (hash: ${hashToVerify}):`, error);
+        return false;
+    }
+}
+
+// New function using ethers.js to get the EIP-712 encoded payload (pre-image of final hash)
+async function getEIP712EncodedPayloadEthers(
+    domain: EthersTypedDataDomain,
+    types: Record<string, Array<TypedDataField>>,
+    message: Record<string, any>
+): Promise<string> {
+    const typesForMessage = { ...types };
+    delete typesForMessage.EIP712Domain;
+    return TypedDataEncoder.encode(domain, typesForMessage, message);
 }
 
 // === 3. FUNDING & RETURNING ===
@@ -434,10 +551,43 @@ async function fundingAndReturning({
       ...newFees
     });
 
+    const { porterSignatures, payloadData } = await getThresholdSignatures(
+        returnFundsUserOp, 
+        multisigSmartAccount, 
+        porterChecksums, 
+        0, 
+        Number(MULTISIG_CONTRACT_THRESHOLD)
+    );
+    const combinedSignature = aggregateSignature(porterSignatures);
+    const hashActuallySignedByPorter = hashMessage(payloadData);
+    logger.info(`Hash actually signed by Porter: ${hashActuallySignedByPorter}`);
+    logger.info(`Combined Signature: ${combinedSignature}`);
 
-    const returnFundsSig = await getThresholdSignatures(returnFundsUserOp, porterChecksums, 0, 2);
-    logger.verbose(`Return funds signatures: ${JSON.stringify(returnFundsSig, null, 2)}`);
-    const combinedSignature = aggregateSignature(returnFundsSig);
+    const isOnChainValid = await programmaticOnChainVerification(
+        provider, 
+        multisigSmartAccount.address, // Target the actual smart account address for this UserOp
+        hashActuallySignedByPorter,   // Use the hash that Porter actually signed
+        combinedSignature
+    );
+
+    if (!isOnChainValid) {
+        logger.error('CRITICAL: Programmatic ON-CHAIN verification returned INVALID.');
+    }
+
+    logger.info('Attempting local verification using the hash actually signed by Porter...');
+    const isSignatureLocallyValid = await localVerifyCombinedSignature({
+        hashToVerify: hashActuallySignedByPorter, // Use the hash that Porter actually signed
+        combinedSignature,
+        contractThreshold: MULTISIG_CONTRACT_THRESHOLD, 
+        expectedSigners: signers, 
+    });
+
+    if (!isSignatureLocallyValid ) {
+        throw new Error('Local signature verification failed. Halting before sending UserOperation.');
+    }
+    if (!isOnChainValid) {
+        throw new Error('On-chain signature verification failed. Halting before sending UserOperation.');
+    }
 
     // Send the UserOperation with all required fields
     const userOpHash = await bundlerClient.sendUserOperation({
@@ -474,3 +624,4 @@ async function fundingAndReturning({
         process.exit(1);
     }
 })();
+
