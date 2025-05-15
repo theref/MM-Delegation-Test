@@ -24,7 +24,7 @@ import {
     SIGNABLE_USER_OP_TYPED_DATA
 } from '@metamask/delegation-toolkit';
 import { ethers, TypedDataDomain as EthersTypedDataDomain, TypedDataField, TypedDataEncoder } from 'ethers';
-import { Address, concat, createPublicClient, createWalletClient, encodeFunctionData, Hex, http, parseEther, WalletClient, zeroAddress, hashTypedData, TypedDataDomain as ViemTypedDataDomain, recoverMessageAddress, hashMessage } from 'viem';
+import { Address, concat, createPublicClient, createWalletClient, encodeFunctionData, Hex, http, parseEther, WalletClient, zeroAddress, hashTypedData, TypedDataDomain as ViemTypedDataDomain, recoverMessageAddress, hashMessage, recoverAddress } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { 
     createPaymasterClient,
@@ -317,7 +317,7 @@ async function getThresholdSignatures(
     ursulaChecksums: `0x${string}`[],
     cohortId: number,
     porterThreshold: number
-): Promise<{ porterSignatures: { [checksumAddress: string]: [string, string] }; payloadData: string }> {
+): Promise<{ porterSignatures: { [checksumAddress: string]: [string, string] }; digestSignedByPorter: string }> {
     const packedUserOp = toPackedUserOperation(userOp);
 
     const viemDomain: ViemTypedDataDomain = {
@@ -400,19 +400,19 @@ async function getThresholdSignatures(
         throw new Error('Invalid response format from Porter: missing signatures'); 
     }
 
-    // Return signatures and hashMessage(eip712Payload)
-    return { porterSignatures: data.result.signing_results.signatures, payloadData: requestB64 };
+    // Return signatures and the original EIP-712 payload that was the basis for data_to_sign
+    return { porterSignatures: data.result.signing_results.signatures, digestSignedByPorter: eip712Payload };
 }
 
 // New function for local signature verification
 async function localVerifyCombinedSignature({
-    hashToVerify,
+    hashForVerification,
     combinedSignature,
     contractThreshold, 
     expectedSigners,
     signatureLength = SIGNATURE_LENGTH
 }: {
-    hashToVerify: Hex;
+    hashForVerification: Hex;
     combinedSignature: Hex;
     contractThreshold: bigint; 
     expectedSigners: readonly Address[];
@@ -426,8 +426,9 @@ async function localVerifyCombinedSignature({
     }
     const actualNumSignatures = (combinedSignature.length - 2) / (signatureLength * 2);
 
-    // Check 2: The number of signatures found must match the required threshold.
-    if (actualNumSignatures >= numSignaturesRequired) {
+    // Check 2: The number of signatures found must be at least the required threshold.
+    if (actualNumSignatures < numSignaturesRequired) {
+        logger.error(`Local verification failed: Not enough signatures. Found ${actualNumSignatures}, require ${numSignaturesRequired}`);
         return false;
     }
 
@@ -440,8 +441,8 @@ async function localVerifyCombinedSignature({
         const individualSignature = `0x${combinedSignature.substring(sigOffset, sigOffset + signatureLength * 2)}` as Hex;
 
         try {
-            const recoveredAddress = await recoverMessageAddress({
-                message: { raw: hashToVerify },
+            const recoveredAddress = await recoverAddress({
+                hash: hashForVerification,
                 signature: individualSignature
             });
             const lowerCaseRecoveredAddress = recoveredAddress.toLowerCase() as Address;
@@ -551,7 +552,7 @@ async function fundingAndReturning({
       ...newFees
     });
 
-    const { porterSignatures, payloadData } = await getThresholdSignatures(
+    const { porterSignatures, digestSignedByPorter } = await getThresholdSignatures(
         returnFundsUserOp, 
         multisigSmartAccount, 
         porterChecksums, 
@@ -559,14 +560,17 @@ async function fundingAndReturning({
         Number(MULTISIG_CONTRACT_THRESHOLD)
     );
     const combinedSignature = aggregateSignature(porterSignatures);
-    const hashActuallySignedByPorter = hashMessage(payloadData);
-    logger.info(`Hash actually signed by Porter: ${hashActuallySignedByPorter}`);
+
+    // For on-chain EIP-1271 verification, the contract expects the EIP-191 hash of the original message.
+    const hashForVerification = hashMessage(digestSignedByPorter);
+    logger.info(`Original EIP-712 Payload (used for local Porter-style signing): ${digestSignedByPorter}`);
+    logger.info(`EIP-191 Hash (hashMessage) of payload (for on-chain EIP-1271 verification): ${hashForVerification}`);
     logger.info(`Combined Signature: ${combinedSignature}`);
 
     const isOnChainValid = await programmaticOnChainVerification(
         provider, 
-        multisigSmartAccount.address, // Target the actual smart account address for this UserOp
-        hashActuallySignedByPorter,   // Use the hash that Porter actually signed
+        multisigSmartAccount.address, 
+        hashForVerification,   // Use the final digest for on-chain EIP-1271 verification
         combinedSignature
     );
 
@@ -574,9 +578,9 @@ async function fundingAndReturning({
         logger.error('CRITICAL: Programmatic ON-CHAIN verification returned INVALID.');
     }
 
-    logger.info('Attempting local verification using the hash actually signed by Porter...');
+    logger.info('Attempting local verification (Porter-style: recover original message using EIP-191)...');
     const isSignatureLocallyValid = await localVerifyCombinedSignature({
-        hashToVerify: hashActuallySignedByPorter, // Use the hash that Porter actually signed
+        hashForVerification, // Use the final digest for local verification
         combinedSignature,
         contractThreshold: MULTISIG_CONTRACT_THRESHOLD, 
         expectedSigners: signers, 
