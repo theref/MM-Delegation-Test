@@ -419,7 +419,7 @@ async function fundingAndReturning({
 
     const isOnChainValid = await verifySignaturesOnChainViaEIP1271(
         provider, 
-        multisigSmartAccount.address,
+        multisigAddress,
         digestToVerify,   // Use the keccak256 hash of the EIP-712 encoded payload
         combinedSignature
     );
