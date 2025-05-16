@@ -73,7 +73,6 @@ export async function requestSignaturesFromPorter(
     cohortId: number = 0,
     context: object = {}
 ): Promise<{ signatures: { [checksumAddress: string]: [string, string] }; claimedSigners: Address[] }> {
-    logger.info(`Requesting ${porterThreshold} signatures from Porter for data: ${dataToSign}`);
     logger.debug(`Ursulas for request: ${ursulaChecksums.join(', ')}`);
 
     const requestData = { data_to_sign: dataToSign, cohort_id: cohortId, context: context };
