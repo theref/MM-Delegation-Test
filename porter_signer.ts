@@ -11,7 +11,6 @@ export const SIGNATURE_LENGTH = 65;
 export const EIP1271_MAGIC_VALUE = "0x1626ba7e";
 
 // --- Logger Setup ---
-// Logger configuration can be made more flexible (e.g., passed in) if needed.
 const logger: Logger = winston.createLogger({
     level: process.env.LOG_LEVEL || 'info', // Default to 'info', can be overridden by .env
     levels: { error: 0, warn: 1, info: 2, verbose: 3, debug: 4 },
@@ -72,16 +71,13 @@ export async function requestSignaturesFromPorter(
     porterThreshold: number,
     cohortId: number = 0,
     context: object = {}
-): Promise<{ signatures: { [checksumAddress: string]: [string, string] }; claimedSigners: Address[] }> {
+): Promise<{ signatures: { [checksumAddress: string]: [string, string] }; claimedSigners: Address[]; messageHash: string }> {
     logger.debug(`Ursulas for request: ${ursulaChecksums.join(', ')}`);
 
     const requestData = { data_to_sign: dataToSign, cohort_id: cohortId, context: context };
     const requestB64 = Buffer.from(JSON.stringify(requestData)).toString('base64');
 
     const signingRequests: { [key: string]: string } = {};
-    // Ensure we only request from available Ursulas, up to the number available if less than threshold
-    // Or, if more Ursulas are available than threshold, it's usually fine to send to all of them,
-    // as Porter will manage the threshold. For this version, let's send to all provided checksums.
     ursulaChecksums.forEach(checksum => {
         if (checksum && typeof checksum === 'string') {
             signingRequests[checksum] = requestB64;
@@ -119,7 +115,31 @@ export async function requestSignaturesFromPorter(
         throw new Error("No signatures found in Porter response or invalid format.");
     }
     
-    const receivedSignatures: { [checksumAddress: string]: [string, string] } = result.result.signing_results.signatures;
+    const receivedSignatures: { [checksumAddress: string]: [string, string] } = {};
+    let messageHash: string | undefined;
+
+    // Parse each signature and extract message hash and signature
+    for (const [ursulaAddress, [signerAddress, signatureB64]] of Object.entries(result.result.signing_results.signatures) as [string, [string, string]][]) {
+        const decodedData = JSON.parse(Buffer.from(signatureB64, 'base64').toString()) as { message_hash: string; signature: string };
+        logger.debug(`Decoded data for ${ursulaAddress}:`, decodedData);
+        
+        if (!messageHash) {
+            messageHash = decodedData.message_hash;
+        } else if (messageHash !== decodedData.message_hash) {
+            logger.warn(`Message hash mismatch for ${ursulaAddress}. Expected ${messageHash}, got ${decodedData.message_hash}`);
+        }
+        
+        // The signature is already in the correct 65-byte format, just add '0x' prefix
+        const formattedSignature = `0x${decodedData.signature}`;
+        logger.info(`Converted signature for ${ursulaAddress}: ${formattedSignature}`);
+        
+        receivedSignatures[ursulaAddress] = [signerAddress, formattedSignature];
+    }
+
+    if (!messageHash) {
+        throw new Error("No message hash found in Porter response");
+    }
+
     const claimedSigners = Object.values(receivedSignatures)
         .map((sigInfo: [string, string]) => sigInfo[0].toLowerCase() as Address);
     logger.info(`Porter claimed signers for this operation: ${claimedSigners.join(',')}`);
@@ -127,12 +147,12 @@ export async function requestSignaturesFromPorter(
     if (claimedSigners.length < porterThreshold) {
         const errMsg = `Porter returned fewer signatures (${claimedSigners.length}) than the required threshold (${porterThreshold}).`;
         logger.error(errMsg);
-        // Potentially still return what was received, but log an error. Or throw, depending on desired strictness.
-        // For now, let's throw if the threshold isn't met by the *returned* signatures.
         throw new Error(errMsg);
     }
 
-    return { signatures: receivedSignatures, claimedSigners };
+    logger.info(`Message hash from Porter: ${messageHash}`);
+
+    return { signatures: receivedSignatures, claimedSigners, messageHash };
 }
 
 /**
@@ -150,14 +170,10 @@ export function aggregatePorterSignatures(
             addr1.toLowerCase().localeCompare(addr2.toLowerCase())
         );
 
-    const sortedHexSignatures = sortedSignaturePairs.map(([ursulaAddress, [signerAddress, signatureB64]]) => {
+    const sortedHexSignatures = sortedSignaturePairs.map(([ursulaAddress, [signerAddress, signature]]) => {
         logger.debug(`Processing signature from Ursula ${ursulaAddress} (signer: ${signerAddress})`);
-        const signatureBuffer = Buffer.from(signatureB64, 'base64');
-        if (signatureBuffer.length !== SIGNATURE_LENGTH) {
-            logger.error(`Invalid signature length for signer ${signerAddress}. Expected ${SIGNATURE_LENGTH}, got ${signatureBuffer.length}`);
-            throw new Error(`Invalid signature length for signer ${signerAddress}. Expected ${SIGNATURE_LENGTH}, got ${signatureBuffer.length}`);
-        }
-        return ('0x' + signatureBuffer.toString('hex')) as Hex;
+        // The signature is already in the correct 65-byte format
+        return signature as Hex;
     });
 
     logger.debug(`Sorted hex signatures for aggregation: ${JSON.stringify(sortedHexSignatures)}`);
