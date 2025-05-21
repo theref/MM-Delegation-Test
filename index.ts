@@ -82,18 +82,18 @@ dotenv.config();
 
 const BASE_SEPOLIA_CHAIN_ID = 84532;
 const MULTISIG_CONTRACT_THRESHOLD = 2n; 
-const multisigAddress = "0x42F30AEc1A36995eEFaf9536Eb62BD751F982D32" as Address;
-const delegationManagerAddress = "0xdb9B1e94B5b69Df7e401DDbedE43491141047dB3" as Address;
-const porterBaseUrl = "https://porter-lynx.nucypher.io";
+const MULTISIG_ADDRESS = "0x42F30AEc1A36995eEFaf9536Eb62BD751F982D32" as Address;
+const DELEGATION_MANAGER_ADDRESS = "0xdb9B1e94B5b69Df7e401DDbedE43491141047dB3" as Address;
+const PORTER_BASE_URL = "https://porter-lynx.nucypher.io";
 
-const multisigContractABI = [
+const MULTISIG_ABI = [
     "function nonce() view returns (uint256)",
     "function getUnsignedTransactionHash(address sender, address destination, uint256 value, bytes memory data, uint256 nonce) view returns (bytes32)",
     "function execute(address destination, uint256 value, bytes memory data, bytes memory signature)"
 ] as const;
 
 async function getPorterChecksums(): Promise<`0x${string}`[]> {
-    return getPorterChecksumsFromLibrary(porterBaseUrl, 3);
+    return getPorterChecksumsFromLibrary(PORTER_BASE_URL, 3);
 }
 
 async function fundAddress(
@@ -119,7 +119,7 @@ async function logBalance(label: string, provider: ethers.JsonRpcProvider, addre
     logger.info(`${label} balance: ${ethers.formatEther(balance)} ETH`);
 }
 
-async function setup() {
+async function setupEnvironment() {
     logger.info('--- SETUP ---');
     if (!process.env.RPC_URL) throw new Error('Please set RPC_URL in your .env file');
     if (!process.env.PRIVATE_KEY) throw new Error('Please set PRIVATE_KEY in your .env file');
@@ -165,7 +165,7 @@ async function setup() {
     };
 }
 
-async function DelegateAndDeployUserSA({
+async function deployAndSetupSmartAccount({
     publicClient,
     localAccount,
     pimlicoClient, 
@@ -197,7 +197,7 @@ async function DelegateAndDeployUserSA({
     }
 
     const delegation = createDelegation({
-        to: multisigAddress,
+        to: MULTISIG_ADDRESS,
         from: userSmartAccount.address,
         caveats: []
     });
@@ -210,8 +210,7 @@ async function DelegateAndDeployUserSA({
     return { userSmartAccount, signedDelegation };
 }
 
-
-async function executeRedemptionViaEIP1271MultisigByEOA({
+async function executeRedemptionViaMultisig({
     provider,
     eoaWallet,
     signedDelegation, 
@@ -220,95 +219,84 @@ async function executeRedemptionViaEIP1271MultisigByEOA({
 }: any) {
     logger.info('--- REDEEMING DELEGATION VIA EIP-1271 MULTISIG (Triggered by EOA) ---');
 
-    logger.verbose(`Delegation Manager Address: ${delegationManagerAddress}`);
+    logger.verbose(`Delegation Manager Address: ${DELEGATION_MANAGER_ADDRESS}`);
 
-    const to_local_funds_recipient = localAccount.address;
-    const value_local_funds = parseEther('0.0001'); 
-    const calldata_local_funds = '0x' as Hex;
-    const inner_execution = createExecution(to_local_funds_recipient, value_local_funds, calldata_local_funds);
-    logger.debug('Inner execution for fund return to EOA created:', inner_execution);
+    const recipientAddress = localAccount.address;
+    const transferAmount = parseEther('0.0001'); 
+    const innerExecution = createExecution(recipientAddress, transferAmount, '0x' as Hex);
+    logger.debug('Inner execution for fund return to EOA created:', innerExecution);
 
-    const calldata_for_dm = DelegationFramework.encode.redeemDelegations({
+    const redemptionCalldata = DelegationFramework.encode.redeemDelegations({
         delegations: [[signedDelegation]],
         modes: [SINGLE_DEFAULT_MODE],
-        executions: [[inner_execution]]
+        executions: [[innerExecution]]
     });
-    logger.debug(`This calldata will instruct userSmartAccount (${signedDelegation.from}) to send ${ethers.formatEther(value_local_funds)} ETH to ${to_local_funds_recipient}`);
-    logger.debug(`The EIP-1271 multisig (${multisigAddress}) will authorize call to DM: ${delegationManagerAddress}`);
+    logger.debug(`This calldata will instruct userSmartAccount (${signedDelegation.from}) to send ${ethers.formatEther(transferAmount)} ETH to ${recipientAddress}`);
+    logger.debug(`The EIP-1271 multisig (${MULTISIG_ADDRESS}) will authorize call to DM: ${DELEGATION_MANAGER_ADDRESS}`);
 
     // Fetch current nonce from multisig contract
-    const multisigContract = new ethers.Contract(multisigAddress, multisigContractABI, provider);
+    const multisigContract = new ethers.Contract(MULTISIG_ADDRESS, MULTISIG_ABI, provider);
     const multisigNonce = await multisigContract.nonce();
     logger.verbose(`Current multisig nonce: ${multisigNonce}`);
 
     const encodedData = ethers.solidityPacked(
         ['address', 'address', 'address', 'uint256', 'bytes', 'uint256'],
         [
-            multisigAddress.toLowerCase(),
+            MULTISIG_ADDRESS.toLowerCase(),
             eoaWallet.address.toLowerCase(),
-            delegationManagerAddress.toLowerCase(),
+            DELEGATION_MANAGER_ADDRESS.toLowerCase(),
             0n,
-            calldata_for_dm,
+            redemptionCalldata,
             multisigNonce
         ]
     ) as Hex;
 
-    const ethersHashMessageOutput = ethers.hashMessage(ethers.getBytes(encodedData));
-    logger.debug(`ethers hashMessage output: ${ethersHashMessageOutput}`);
+    const messageHash = ethers.hashMessage(ethers.getBytes(encodedData));
+    logger.debug(`Message hash: ${messageHash}`);
 
-    // Verify that our offchain hash matches the contract's getUnsignedTransactionHash
-    const contractHash = await multisigContract.getUnsignedTransactionHash(
-        eoaWallet.address.toLowerCase(),
-        delegationManagerAddress.toLowerCase(),
-        0n,
-        calldata_for_dm,
-        multisigNonce
-    );
-    logger.debug(`Contract's getUnsignedTransactionHash: ${contractHash}`);
-
-    const { signatures: porterSignaturesForMultisigAction, claimedSigners, messageHash: messageHashFromPorter } = await requestSignaturesFromPorter(
-        porterBaseUrl,
+    const { signatures: porterSignatures, claimedSigners, messageHash: porterMessageHash } = await requestSignaturesFromPorter(
+        PORTER_BASE_URL,
         encodedData,
         porterChecksums,
         Number(MULTISIG_CONTRACT_THRESHOLD) 
     );
-    logger.verbose(`Message hash from Porter: ${messageHashFromPorter}`);
-    const combinedPorterSignature = aggregatePorterSignatures(porterSignaturesForMultisigAction);
-    logger.verbose(`Combined Porter signature for multisig action: ${combinedPorterSignature}`);
+    logger.verbose(`Message hash from Porter: ${porterMessageHash}`);
+    const combinedSignature = aggregatePorterSignatures(porterSignatures);
+    logger.verbose(`Combined Porter signature: ${combinedSignature}`);
     logger.verbose(`Porter claimed signers for this action: ${claimedSigners.join(', ')}`);
 
     logger.info('Performing EIP-1271 pre-flight check for the Porter signature against the multisig...');
-    const isActionSignatureValidEIP1271 = await verifySignaturesOnChainViaEIP1271(
+    const isSignatureValid = await verifySignaturesOnChainViaEIP1271(
         provider,
-        multisigAddress, 
-        ethersHashMessageOutput as `0x${string}`,
-        combinedPorterSignature
+        MULTISIG_ADDRESS, 
+        messageHash as `0x${string}`,
+        combinedSignature
     );
 
-    if (!isActionSignatureValidEIP1271) {
+    if (!isSignatureValid) {
         throw new Error('Porter signature for multisig action FAILED EIP-1271 pre-flight check. Halting.');
     }
     logger.info('SUCCESS: Porter signature for multisig action PASSED EIP-1271 pre-flight check.');
 
     // Updated to match the multisig's execute function
-    const multisigContractInterface = new ethers.Interface([
+    const multisigInterface = new ethers.Interface([
         "function execute(address destination, uint256 value, bytes memory data, bytes memory signature)"
     ]);
-    const callDataForMultisigExecute = multisigContractInterface.encodeFunctionData("execute", [
-        delegationManagerAddress,
+    const executeCalldata = multisigInterface.encodeFunctionData("execute", [
+        DELEGATION_MANAGER_ADDRESS,
         0n,
-        calldata_for_dm,
-        combinedPorterSignature
+        redemptionCalldata,
+        combinedSignature
     ]);
 
-    logger.info(`Sending transaction from EOA (${eoaWallet.address}) to Multisig (${multisigAddress}) to execute the redemption...`);
-    logger.debug(`Multisig will call DM (${delegationManagerAddress}) with data: ${calldata_for_dm.substring(0,100)}...`);
-    logger.debug(`DM will instruct UserSA (${signedDelegation.delegator}) to send ${ethers.formatEther(value_local_funds)} ETH to ${to_local_funds_recipient}`);
+    logger.info(`Sending transaction from EOA (${eoaWallet.address}) to Multisig (${MULTISIG_ADDRESS}) to execute the redemption...`);
+    logger.debug(`Multisig will call DM (${DELEGATION_MANAGER_ADDRESS}) with data: ${redemptionCalldata.substring(0,100)}...`);
+    logger.debug(`DM will instruct UserSA (${signedDelegation.delegator}) to send ${ethers.formatEther(transferAmount)} ETH to ${recipientAddress}`);
 
     try {
         const tx = await eoaWallet.sendTransaction({
-            to: multisigAddress,
-            data: callDataForMultisigExecute as Hex,
+            to: MULTISIG_ADDRESS,
+            data: executeCalldata as Hex,
             value: 0n,
         });
         logger.verbose(`Transaction sent by EOA to trigger multisig: ${tx.hash}`);
@@ -334,18 +322,18 @@ async function executeRedemptionViaEIP1271MultisigByEOA({
 
 (async function main() {
     try {
-        const setupResult = await setup();
-        const { userSmartAccount, signedDelegation } = await DelegateAndDeployUserSA(setupResult);
+        const env = await setupEnvironment();
+        const { userSmartAccount, signedDelegation } = await deployAndSetupSmartAccount(env);
         
 
         logger.info("--- Funding User Smart Account (Delegator) ---");
-        await fundAddress(setupResult.provider, userSmartAccount.address, parseEther('0.0001'));
-        await logBalance('User Smart Account (Delegator) before redemption', setupResult.provider, userSmartAccount.address);
-        await logBalance(`Local EOA (${setupResult.localAccount.address}) before redemption`, setupResult.provider, setupResult.localAccount.address);
+        await fundAddress(env.provider, userSmartAccount.address, parseEther('0.0001'));
+        await logBalance('User Smart Account (Delegator) before redemption', env.provider, userSmartAccount.address);
+        await logBalance(`Local EOA (${env.localAccount.address}) before redemption`, env.provider, env.localAccount.address);
 
 
-        await executeRedemptionViaEIP1271MultisigByEOA({
-            ...setupResult,
+        await executeRedemptionViaMultisig({
+            ...env,
             userSmartAccount,
             signedDelegation
         });
