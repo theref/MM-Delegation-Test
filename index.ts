@@ -3,7 +3,7 @@
 // ----------------------------------------------------------------------------
 // This script demonstrates how to:
 // 1. Set up a Hybrid (delegator) smart account.
-// 2. Delegate authority from the Hybrid to an existing EIP-1271 MultiSig contract.
+// 2. Delegate authority from the Hybrid to a TACo EIP-1271 MultiSig contract.
 // 3. Have the EIP-1271 MultiSig authorize a call to the DelegationManager to redeem the delegation.
 // 4. The redemption instructs the Hybrid account to return funds to a local EOA.
 // 5. The transaction to trigger the EIP-1271 MultiSig is sent by the local EOA.
@@ -19,34 +19,24 @@ import {
     toMetaMaskSmartAccount,
     DelegationFramework,
     SINGLE_DEFAULT_MODE,
-    // SignUserOperationParams, // Not directly used now
-    MetaMaskSmartAccount, // Still used for userSmartAccount (delegator)
-    // SIGNABLE_USER_OP_TYPED_DATA, // May be needed if multisig's internal signing uses it explicitly
-    createExecution, // NEW IMPORT
+    createExecution,
 } from '@metamask/delegation-toolkit';
-import { ethers, TypedDataDomain as EthersTypedDataDomain, TypedDataField, TypedDataEncoder, Contract } from 'ethers'; // Added Contract
-import { Address, concat, createPublicClient, createWalletClient, encodeFunctionData, Hex, toHex, http, parseEther, WalletClient, zeroAddress, hashTypedData, TypedDataDomain as ViemTypedDataDomain, recoverMessageAddress, hashMessage, recoverAddress, keccak256, fromHex } from 'viem';
-import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
+import { ethers } from 'ethers';
+import { Address, createPublicClient, Hex, http, parseEther, zeroAddress } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
 import { 
     createPaymasterClient,
     createBundlerClient,
-    // getUserOperationHash, // Not directly used now
-    // toPackedUserOperation, // Not directly used now
-    type UserOperation // Potentially for typing if we ever prepare one, even if not sent by AA
 } from 'viem/account-abstraction';
 import { baseSepolia } from 'viem/chains';
 import * as dotenv from 'dotenv';
-import * as fs from 'fs';
 import winston, { Logger } from 'winston';
-import { hexlify } from 'ethers';
-import { Buffer } from 'buffer';
 
 // Import from the new Porter Signer library
 import {
     getPorterChecksums as getPorterChecksumsFromLibrary, 
     requestSignaturesFromPorter,
     aggregatePorterSignatures,
-    // verifySignaturesLocally, // Might not be needed if EIP-1271 check is sufficient pre-flight
     verifySignaturesOnChainViaEIP1271
 } from './porter_signer';
 
@@ -96,21 +86,16 @@ const multisigAddress = "0x42F30AEc1A36995eEFaf9536Eb62BD751F982D32" as Address;
 const delegationManagerAddress = "0xdb9B1e94B5b69Df7e401DDbedE43491141047dB3" as Address;
 const porterBaseUrl = "https://porter-lynx.nucypher.io";
 
-// Add multisig contract ABI for nonce fetching
 const multisigContractABI = [
     "function nonce() view returns (uint256)",
-    "function getUnsignedTransactionHash(address sender, address destination, uint256 value, bytes memory data, uint256 nonce) view returns (bytes32)"
+    "function getUnsignedTransactionHash(address sender, address destination, uint256 value, bytes memory data, uint256 nonce) view returns (bytes32)",
+    "function execute(address destination, uint256 value, bytes memory data, bytes memory signature)"
 ] as const;
 
 async function getPorterChecksums(): Promise<`0x${string}`[]> {
     return getPorterChecksumsFromLibrary(porterBaseUrl, 3);
 }
 
-// REMOVED: getSigners() - not needed if we are not deploying a new MM multisig
-// REMOVED: getThresholdSignatures() - specific to old UserOp flow with MM multisig
-// REMOVED: getEIP712EncodedPayloadEthers() - specific to old UserOp flow, will create new if needed for multisig action
-
-// Function to fund any AA wallet or EOA (kept for funding userSmartAccount)
 async function fundAddress(
     provider: ethers.JsonRpcProvider,
     toAddress: string,
@@ -123,8 +108,8 @@ async function fundAddress(
         value: amount
     };
     const txResponse = await wallet.sendTransaction(tx);
-    logger.info(`Funding transaction sent: ${txResponse.hash}`);
-    logger.info(`View on Etherscan: https://base-sepolia.etherscan.io/tx/${txResponse.hash}`);
+    logger.verbose(`Funding transaction sent: ${txResponse.hash}`);
+    logger.verbose(`View on Etherscan: https://sepolia.basescan.org/tx/${txResponse.hash}`);
     await txResponse.wait();
     logger.info('Funding transaction confirmed');
 }
@@ -152,11 +137,10 @@ async function setup() {
         transport: http(process.env.RPC_URL)
     });
     
-    // Bundler/Pimlico might still be useful for gas prices or if we ever submit UserOps for userSmartAccount
     const paymasterClient = createPaymasterClient({ transport: http(process.env.BUNDLER_URL) });
     const { createPimlicoClient } = await import("permissionless/clients/pimlico");
     const pimlicoClient = createPimlicoClient({ transport: http(process.env.BUNDLER_URL) });
-    const {fast: fees} = await pimlicoClient.getUserOperationGasPrice(); // Good for general gas price
+    const {fast: fees} = await pimlicoClient.getUserOperationGasPrice();
     
     const bundlerClient = createBundlerClient({
         transport: http(process.env.BUNDLER_URL),
@@ -164,22 +148,19 @@ async function setup() {
         chain: baseSepolia
     });
     const localAccount = privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`);
-    const eoaWallet = new ethers.Wallet(process.env.PRIVATE_KEY as string, provider); // Ethers wallet for localAccount
+    const eoaWallet = new ethers.Wallet(process.env.PRIVATE_KEY as string, provider);
 
-    // const signers = await getSigners(); // Not needed
     const porterChecksums = await getPorterChecksums();
-
+    logger.info("Setup complete. Returning environment...");
     return {
         provider,
         environment,
         publicClient,
-        // paymasterClient, // Not directly used for the EOA tx flow
-        pimlicoClient, // For gas prices
-        fees, // Gas prices
-        bundlerClient, // For userSmartAccount deployment / potential UOs
-        localAccount, // Viem local account object
-        eoaWallet, // Ethers.js wallet for local EOA
-        // signers, // Not needed
+        pimlicoClient,
+        fees,
+        bundlerClient,
+        localAccount,
+        eoaWallet,
         porterChecksums,
     };
 }
@@ -189,7 +170,6 @@ async function DelegateAndDeployUserSA({
     localAccount,
     pimlicoClient, 
     bundlerClient,
-    // paymasterClient // Not strictly needed if userSA pays its own gas or funded EOA deploys
 }: any) {
     logger.info('--- DEPLOYING USER SMART ACCOUNT & SETTING UP DELEGATION ---');
     const userSmartAccount = await toMetaMaskSmartAccount({
@@ -197,7 +177,6 @@ async function DelegateAndDeployUserSA({
         implementation: Implementation.Hybrid,
         deployParams: [localAccount.address, [], [], []],
         deploySalt: "0x" as Hex,
-        // deploySalt: ("0x" + Buffer.from(Date.now().toString()).toString('hex').padStart(64, '0')) as Hex, // More unique salt
         signatory: { account: localAccount }
     });
 
@@ -208,16 +187,13 @@ async function DelegateAndDeployUserSA({
     const userOperationHash = await bundlerClient!.sendUserOperation({
       account: userSmartAccount,
            calls: [{ to: zeroAddress, value: 0n, data: '0x' }], 
-           // paymasterAndData: ..., // Optional: if using a paymaster for deployment
       ...fee,
-           // verificationGasLimit: BigInt(600000), // May need adjustment
-           // callGasLimit: BigInt(300000), // May need adjustment
          });
-         logger.info(`User Smart Account deployment UserOp sent: ${userOperationHash}. Waiting for receipt...`);
+         logger.verbose(`User Smart Account deployment UserOp sent: ${userOperationHash}. Waiting for receipt...`);
          const { receipt } = await bundlerClient!.waitForUserOperationReceipt({ hash: userOperationHash });
          logger.info(`User Smart Account deployed at: ${userSmartAccount.address}, tx: ${receipt.transactionHash}`);
     } else {
-        logger.info(`User Smart Account ${userSmartAccount.address} already deployed.`);
+        logger.verbose(`User Smart Account ${userSmartAccount.address} already deployed.`);
     }
 
     const delegation = createDelegation({
@@ -225,7 +201,7 @@ async function DelegateAndDeployUserSA({
         from: userSmartAccount.address,
         caveats: []
     });
-    logger.verbose('Delegation created:', JSON.stringify(delegation, null, 2));
+    logger.debug('Delegation created:', JSON.stringify(delegation, null, 2));
 
     const signature = await userSmartAccount.signDelegation({ delegation });
     const signedDelegation = { ...delegation, signature };
@@ -236,18 +212,15 @@ async function DelegateAndDeployUserSA({
 
 
 async function executeRedemptionViaEIP1271MultisigByEOA({
-    provider, // Ethers provider
-    eoaWallet, // Ethers Wallet for localAccount, to send the final tx
-    environment, 
-    // userSmartAccount, // Not directly used to send the TX, but its address is in signedDelegation
+    provider,
+    eoaWallet,
     signedDelegation, 
-    localAccount, // For recipient and its address
+    localAccount,
     porterChecksums,
-    // No bundler/pimlico needed here as EOA sends the tx
 }: any) {
     logger.info('--- REDEEMING DELEGATION VIA EIP-1271 MULTISIG (Triggered by EOA) ---');
 
-    logger.info(`Delegation Manager Address: ${delegationManagerAddress}`);
+    logger.verbose(`Delegation Manager Address: ${delegationManagerAddress}`);
 
     const to_local_funds_recipient = localAccount.address;
     const value_local_funds = parseEther('0.0001'); 
@@ -260,15 +233,14 @@ async function executeRedemptionViaEIP1271MultisigByEOA({
         modes: [SINGLE_DEFAULT_MODE],
         executions: [[inner_execution]]
     });
-    logger.verbose(`This calldata will instruct userSmartAccount (${signedDelegation.from}) to send ${ethers.formatEther(value_local_funds)} ETH to ${to_local_funds_recipient}`);
-    logger.verbose(`The EIP-1271 multisig (${multisigAddress}) will authorize call to DM: ${delegationManagerAddress}`);
+    logger.debug(`This calldata will instruct userSmartAccount (${signedDelegation.from}) to send ${ethers.formatEther(value_local_funds)} ETH to ${to_local_funds_recipient}`);
+    logger.debug(`The EIP-1271 multisig (${multisigAddress}) will authorize call to DM: ${delegationManagerAddress}`);
 
     // Fetch current nonce from multisig contract
     const multisigContract = new ethers.Contract(multisigAddress, multisigContractABI, provider);
     const multisigNonce = await multisigContract.nonce();
-    logger.info(`Current multisig nonce: ${multisigNonce}`);
+    logger.verbose(`Current multisig nonce: ${multisigNonce}`);
 
-    // Get the hash that the multisig will use for verification
     const encodedData = ethers.solidityPacked(
         ['address', 'address', 'address', 'uint256', 'bytes', 'uint256'],
         [
@@ -282,7 +254,7 @@ async function executeRedemptionViaEIP1271MultisigByEOA({
     ) as Hex;
 
     const ethersHashMessageOutput = ethers.hashMessage(ethers.getBytes(encodedData));
-    logger.info(`ethers hashMessage output: ${ethersHashMessageOutput}`);
+    logger.debug(`ethers hashMessage output: ${ethersHashMessageOutput}`);
 
     // Verify that our offchain hash matches the contract's getUnsignedTransactionHash
     const contractHash = await multisigContract.getUnsignedTransactionHash(
@@ -292,7 +264,7 @@ async function executeRedemptionViaEIP1271MultisigByEOA({
         calldata_for_dm,
         multisigNonce
     );
-    logger.info(`Contract's getUnsignedTransactionHash: ${contractHash}`);
+    logger.debug(`Contract's getUnsignedTransactionHash: ${contractHash}`);
 
     const { signatures: porterSignaturesForMultisigAction, claimedSigners, messageHash: messageHashFromPorter } = await requestSignaturesFromPorter(
         porterBaseUrl,
@@ -300,10 +272,10 @@ async function executeRedemptionViaEIP1271MultisigByEOA({
         porterChecksums,
         Number(MULTISIG_CONTRACT_THRESHOLD) 
     );
-    logger.info(`Message hash from Porter: ${messageHashFromPorter}`);
+    logger.verbose(`Message hash from Porter: ${messageHashFromPorter}`);
     const combinedPorterSignature = aggregatePorterSignatures(porterSignaturesForMultisigAction);
-    logger.info(`Combined Porter signature for multisig action: ${combinedPorterSignature}`);
-    logger.info(`Porter claimed signers for this action: ${claimedSigners.join(', ')}`);
+    logger.verbose(`Combined Porter signature for multisig action: ${combinedPorterSignature}`);
+    logger.verbose(`Porter claimed signers for this action: ${claimedSigners.join(', ')}`);
 
     logger.info('Performing EIP-1271 pre-flight check for the Porter signature against the multisig...');
     const isActionSignatureValidEIP1271 = await verifySignaturesOnChainViaEIP1271(
@@ -330,19 +302,17 @@ async function executeRedemptionViaEIP1271MultisigByEOA({
     ]);
 
     logger.info(`Sending transaction from EOA (${eoaWallet.address}) to Multisig (${multisigAddress}) to execute the redemption...`);
-    logger.info(`Multisig will call DM (${delegationManagerAddress}) with data: ${calldata_for_dm.substring(0,100)}...`);
-    logger.info(`DM will instruct UserSA (${signedDelegation.delegator}) to send ${ethers.formatEther(value_local_funds)} ETH to ${to_local_funds_recipient}`);
+    logger.debug(`Multisig will call DM (${delegationManagerAddress}) with data: ${calldata_for_dm.substring(0,100)}...`);
+    logger.debug(`DM will instruct UserSA (${signedDelegation.delegator}) to send ${ethers.formatEther(value_local_funds)} ETH to ${to_local_funds_recipient}`);
 
     try {
         const tx = await eoaWallet.sendTransaction({
             to: multisigAddress,
-            data: callDataForMultisigExecute as Hex, // Cast as Hex, ensure it's valid
-            value: 0n, // Assuming the multisig execution function is not payable
-            // gasLimit: ..., // Optional: estimate or set manually
-            // gasPrice: ..., // Optional: use provider's or set manually
+            data: callDataForMultisigExecute as Hex,
+            value: 0n,
         });
-        logger.info(`Transaction sent by EOA to trigger multisig: ${tx.hash}`);
-        logger.info(`View on Etherscan: https://sepolia.basescan.org/tx/${tx.hash}`);
+        logger.verbose(`Transaction sent by EOA to trigger multisig: ${tx.hash}`);
+        logger.verbose(`View on Etherscan: https://sepolia.basescan.org/tx/${tx.hash}`);
         const receipt = await tx.wait();
         logger.info('Transaction confirmed!', receipt);
         if (receipt?.status !== 1) {
@@ -367,20 +337,16 @@ async function executeRedemptionViaEIP1271MultisigByEOA({
         const setupResult = await setup();
         const { userSmartAccount, signedDelegation } = await DelegateAndDeployUserSA(setupResult);
         
-        // Commenting out funding section to save ETH during testing
 
         logger.info("--- Funding User Smart Account (Delegator) ---");
-        // Ensure userSmartAccount has funds to make the transfer later
-        // It needs at least 0.0001 ETH for the transfer + gas for its internal execution part.
-        // const requiredFundingForUserSA = parseEther('0.001'); // Adjust as needed, e.g. 0.0001 for transfer + gas allowance
-        // await fundAddress(setupResult.provider, userSmartAccount.address, requiredFundingForUserSA); 
+        await fundAddress(setupResult.provider, userSmartAccount.address, parseEther('0.0001'));
         await logBalance('User Smart Account (Delegator) before redemption', setupResult.provider, userSmartAccount.address);
         await logBalance(`Local EOA (${setupResult.localAccount.address}) before redemption`, setupResult.provider, setupResult.localAccount.address);
 
 
         await executeRedemptionViaEIP1271MultisigByEOA({
             ...setupResult,
-            userSmartAccount, // Though not directly used to send, its address is in signedDelegation
+            userSmartAccount,
             signedDelegation
         });
 

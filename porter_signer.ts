@@ -32,7 +32,7 @@ winston.addColors({ error: 'red', warn: 'yellow', info: 'green', verbose: 'cyan'
  * @returns A promise that resolves to an array of Ursula checksum addresses.
  */
 export async function getPorterChecksums(porterBaseUrl: string, quantity: number = 3): Promise<Address[]> {
-    logger.info(`Fetching ${quantity} Ursula checksums from Porter at ${porterBaseUrl}...`);
+    logger.verbose(`Fetching ${quantity} Ursula checksums from Porter at ${porterBaseUrl}...`);
     try {
         const response = await fetch(`${porterBaseUrl}/get_ursulas?quantity=${quantity}`);
         if (!response.ok) {
@@ -46,7 +46,7 @@ export async function getPorterChecksums(porterBaseUrl: string, quantity: number
             throw new Error('Invalid response structure from Porter /get_ursulas');
         }
         const checksums = data.result.ursulas.map((ursula: any) => ursula.checksum_address.toLowerCase() as Address);
-        logger.info(`Retrieved ${checksums.length} Ursula nodes from Porter: ${checksums.join(',')}`);
+        logger.verbose(`Retrieved ${checksums.length} Ursula nodes from Porter: ${checksums.join(',')}`);
         return checksums;
     } catch (error: any) {
         logger.error(`Error fetching Ursulas from Porter: ${error.message}`);
@@ -131,7 +131,7 @@ export async function requestSignaturesFromPorter(
         
         // The signature is already in the correct 65-byte format, just add '0x' prefix
         const formattedSignature = `0x${decodedData.signature}`;
-        logger.info(`Converted signature for ${ursulaAddress}: ${formattedSignature}`);
+        logger.debug(`Converted signature for ${ursulaAddress}: ${formattedSignature}`);
         
         receivedSignatures[ursulaAddress] = [signerAddress, formattedSignature];
     }
@@ -142,7 +142,7 @@ export async function requestSignaturesFromPorter(
 
     const claimedSigners = Object.values(receivedSignatures)
         .map((sigInfo: [string, string]) => sigInfo[0].toLowerCase() as Address);
-    logger.info(`Porter claimed signers for this operation: ${claimedSigners.join(',')}`);
+    logger.verbose(`Porter claimed signers for this operation: ${claimedSigners.join(',')}`);
     
     if (claimedSigners.length < porterThreshold) {
         const errMsg = `Porter returned fewer signatures (${claimedSigners.length}) than the required threshold (${porterThreshold}).`;
@@ -150,7 +150,7 @@ export async function requestSignaturesFromPorter(
         throw new Error(errMsg);
     }
 
-    logger.info(`Message hash from Porter: ${messageHash}`);
+    logger.verbose(`Message hash from Porter: ${messageHash}`);
 
     return { signatures: receivedSignatures, claimedSigners, messageHash };
 }
@@ -178,7 +178,7 @@ export function aggregatePorterSignatures(
 
     logger.debug(`Sorted hex signatures for aggregation: ${JSON.stringify(sortedHexSignatures)}`);
     const combined = concat(sortedHexSignatures);
-    logger.info(`Combined signature (${combined.length / 2 -1} bytes): ${combined}`); // length includes '0x'
+    logger.verbose(`Combined signature (${combined.length / 2 -1} bytes): ${combined}`); // length includes '0x'
     return combined;
 }
 
@@ -196,7 +196,7 @@ export async function verifySignaturesLocally(
     threshold: bigint,
     expectedSigners: readonly Address[]
 ): Promise<boolean> {
-    logger.info(`Attempting local verification for digest: ${digestToVerify}`);
+    logger.verbose(`Attempting local verification for digest: ${digestToVerify}`);
     const numSignaturesRequired = Number(threshold);
 
     // Check 1: Combined signature must have a total length that's a multiple of individual signature lengths.
@@ -207,8 +207,6 @@ export async function verifySignaturesLocally(
     const actualNumSignatures = (combinedSignature.length - 2) / (SIGNATURE_LENGTH * 2);
 
     // Check 2: The number of signatures found must be at least the required threshold.
-    // Note: The combinedSignature might contain more signatures than the threshold if Porter returned more.
-    // We only need to verify `numSignaturesRequired` of them.
     if (actualNumSignatures < numSignaturesRequired) {
         logger.error(`Local verify fail: Not enough sigs in combined sig. Found ${actualNumSignatures}, need at least ${numSignaturesRequired}.`);
         return false;
@@ -218,9 +216,7 @@ export async function verifySignaturesLocally(
     const lowerCaseExpectedSigners = expectedSigners.map(s => s.toLowerCase() as Address);
     const recoveredSignersInThisSet = new Set<Address>();
 
-    // We iterate through the signatures in the combinedSignature.
-    // Since aggregatePorterSignatures sorts them by signer address, these checks should pass.
-    for (let i = 0; i < actualNumSignatures; i++) { // Iterate over all actual signatures
+    for (let i = 0; i < actualNumSignatures; i++) {
         const sigOffset = 2 + i * SIGNATURE_LENGTH * 2;
         const individualSignature = `0x${combinedSignature.substring(sigOffset, sigOffset + SIGNATURE_LENGTH * 2)}` as Hex;
 
@@ -228,20 +224,16 @@ export async function verifySignaturesLocally(
             const recoveredAddress = await recoverAddress({ hash: digestToVerify, signature: individualSignature });
             const lowerCaseRecoveredAddress = recoveredAddress.toLowerCase() as Address;
 
-            // Check 3: Recovered signer must be in the expected list (Porter claimed signers).
             if (!lowerCaseExpectedSigners.includes(lowerCaseRecoveredAddress)) {
                 logger.error(`Local verify fail: Recovered signer ${lowerCaseRecoveredAddress} not in expected list: [${lowerCaseExpectedSigners.join(',')}]`);
-                // If any signature is from an unexpected signer, this is a problem.
                 return false;
             }
 
-            // Check 4: Signers must be in strictly ascending order.
             if (lowerCaseRecoveredAddress.localeCompare(lastRecoveredSigner) <= 0) {
                 logger.error(`Local verify fail: Signer order invalid. Current ${lowerCaseRecoveredAddress}, previous ${lastRecoveredSigner}.`);
                 return false;
             }
             
-            // Check 5: No duplicate signers in the set being verified.
             if (recoveredSignersInThisSet.has(lowerCaseRecoveredAddress)) {
                 logger.error(`Local verify fail: Duplicate signer ${lowerCaseRecoveredAddress} found.`);
                 return false;
@@ -256,8 +248,6 @@ export async function verifySignaturesLocally(
         }
     }
     
-    // After verifying all individual signatures in the combined set,
-    // ensure that the count of unique, valid, ordered signers meets the threshold.
     if (recoveredSignersInThisSet.size < numSignaturesRequired) {
         logger.error(`Local verify fail: Number of unique valid signers (${recoveredSignersInThisSet.size}) is less than threshold (${numSignaturesRequired}).`);
         return false;
@@ -281,7 +271,7 @@ export async function verifySignaturesOnChainViaEIP1271(
     hashToVerify: Hex,
     signature: Hex
 ): Promise<boolean> {
-    logger.info(`Attempting on-chain EIP-1271 verification for contract ${contractAddress}, hash ${hashToVerify}`);
+    logger.verbose(`Attempting on-chain EIP-1271 verification for contract ${contractAddress}, hash ${hashToVerify}`);
     const contractAbi = ["function isValidSignature(bytes32 _hash, bytes _signature) external view returns (bytes4)"];
     const contract = new ethers.Contract(contractAddress, contractAbi, provider);
     try {
@@ -295,7 +285,6 @@ export async function verifySignaturesOnChainViaEIP1271(
             return false;
         }
     } catch (error: any) {
-        // Log the full error if available, especially for contract reverts
         const revertReason = error.reason || (error.data ? ethers.toUtf8String(error.data) : null) || error.message;
         logger.error(`ERROR during on-chain verification for ${contractAddress} (hash: ${hashToVerify}): ${revertReason}`, error);
         return false;
