@@ -22,6 +22,8 @@ import {
 import { baseSepolia } from 'viem/chains';
 import * as dotenv from 'dotenv';
 import winston, { Logger } from 'winston';
+import { getUserOperationHash } from 'viem/account-abstraction';
+import { ENTRY_POINT_ADDRESS } from './constants';
 
 // Import from the Porter Signer library
 import {
@@ -213,52 +215,74 @@ async function executeViaMultisig({
     // Prepare the execution UserOperation
     logger.debug(`Preparing user operation with data: target=${recipientAddress}, value=${transferAmount.toString()}, callData=${executionData.callData}`);
 
-    const userOperation = await bundlerClient!.prepareUserOperation({
-        account: userSmartAccount,
-        calls: [executionData]
-    });
-    logger.debug(`Prepared user operation: sender=${userOperation.sender}, nonce=${userOperation.nonce.toString()}, initCode=${userOperation.initCode}, callData=${userOperation.callData}, callGasLimit=${userOperation.callGasLimit.toString()}, verificationGasLimit=${userOperation.verificationGasLimit.toString()}, preVerificationGas=${userOperation.preVerificationGas.toString()}, maxFeePerGas=${userOperation.maxFeePerGas.toString()}, maxPriorityFeePerGas=${userOperation.maxPriorityFeePerGas.toString()}, paymasterAndData=${userOperation.paymasterAndData}`);
+    try {
+        // Get gas parameters first
+        const { fast: fee } = await pimlicoClient!.getUserOperationGasPrice();
+        logger.debug(`Got gas price: maxFeePerGas=${fee.maxFeePerGas.toString()}, maxPriorityFeePerGas=${fee.maxPriorityFeePerGas.toString()}`);
 
-    // Get the proper typed data hash that the EntryPoint will use
-    const userOpHash = await userSmartAccount.getPackedUserOperationTypedDataHash(userOperation);
-    logger.verbose(`Got UserOperation typed data hash: ${userOpHash}`);
+        // Prepare the user operation with gas parameters
+        const userOperation = await bundlerClient!.prepareUserOperation({
+            account: userSmartAccount,
+            calls: [executionData],
+            maxFeePerGas: fee.maxFeePerGas,
+            maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
+            // Set minimum gas limits
+            callGasLimit: 100000n,
+            preVerificationGas: 100000n,
+            verificationGasLimit: 100000n
+        });
+        logger.debug(`Prepared user operation: sender=${userOperation.sender}, nonce=${userOperation.nonce.toString()}, initCode=${userOperation.initCode}, callData=${userOperation.callData}, callGasLimit=${userOperation.callGasLimit.toString()}, verificationGasLimit=${userOperation.verificationGasLimit.toString()}, preVerificationGas=${userOperation.preVerificationGas.toString()}, maxFeePerGas=${userOperation.maxFeePerGas.toString()}, maxPriorityFeePerGas=${userOperation.maxPriorityFeePerGas.toString()}, paymasterAndData=${userOperation.paymasterAndData}`);
 
-    // Get signatures from Porter for the execution UserOperation
-    logger.debug(`Requesting signatures from Porter...`);
-    const { signatures: porterSignatures, claimedSigners } = await requestSignaturesFromPorter(
-        PORTER_BASE_URL,
-        userOpHash,
-        porterChecksums,
-        Number(threshold)
-    );
-    logger.verbose(`Got signatures from Porter for execution`);
+        // Get the user operation hash using viem's utility function
+        const userOpHash = getUserOperationHash({
+            userOperation,
+            entryPointAddress: ENTRY_POINT_ADDRESS as Address,
+            chainId: baseSepolia.id,
+            entryPointVersion: '0.6'
+        });
+        logger.debug(`Generated user operation hash: ${userOpHash}`);
 
-    // Aggregate the signatures using the delegation toolkit's format
-    const aggregatedSignature = aggregateSignature({
-        signatures: Object.entries(porterSignatures).map(([signer, [_, signature]]) => ({
-            signer: signer as Address,
-            signature: signature as `0x${string}`,
-            type: "ECDSA"
-        }))
-    });
-    logger.debug(`Aggregated signature: ${aggregatedSignature}`);
+        // Get signatures from Porter for the execution UserOperation
+        logger.debug(`Requesting signatures from Porter...`);
+        const { signatures: porterSignatures, claimedSigners } = await requestSignaturesFromPorter(
+            PORTER_BASE_URL,
+            userOpHash,
+            porterChecksums,
+            Number(threshold)
+        );
+        logger.debug(`Got signatures from Porter: ${JSON.stringify(porterSignatures)}`);
+        logger.debug(`Claimed signers: ${claimedSigners.join(', ')}`);
 
-    // Send the UserOperation with the aggregated signature
-    logger.debug(`Sending user operation with signature...`);
-    const { fast: fee } = await pimlicoClient!.getUserOperationGasPrice();
-    logger.debug(`Got gas price: ${JSON.stringify(fee)}`);
-    
-    const userOperationHash = await bundlerClient!.sendUserOperation({
-        ...userOperation,
-        signature: aggregatedSignature,
-        ...fee,
-    });
-    logger.verbose(`Execution UserOp sent: ${userOperationHash}. Waiting for receipt...`);
-    const { receipt } = await bundlerClient!.waitForUserOperationReceipt({ hash: userOperationHash });
-    logger.info(`Execution completed, tx: ${receipt.transactionHash}`);
+        // Aggregate the signatures using the MultiSig format (sorted and concatenated)
+        const sortedSignaturePairs = Object.entries(porterSignatures)
+            .sort(([_, [addr1]], [__, [addr2]]) => 
+                addr1.toLowerCase().localeCompare(addr2.toLowerCase())
+            );
 
-    await logBalance(`Local EOA (${localAccount.address}) AFTER transfer`, provider, localAccount.address);
-    await logBalance('User Smart Account AFTER transfer', provider, userSmartAccount.address);
+        const sortedSignatures = sortedSignaturePairs.map(([_, [__, signature]]) => signature);
+        const aggregatedSignature = `0x${sortedSignatures.join('').slice(2)}` as Hex;
+        logger.debug(`Aggregated signature: ${aggregatedSignature}`);
+
+        // Send the UserOperation with the aggregated signature
+        logger.debug(`Sending user operation with signature...`);
+        
+        const userOperationHash = await bundlerClient!.sendUserOperation({
+            ...userOperation,
+            signature: aggregatedSignature,
+        });
+        logger.verbose(`Execution UserOp sent: ${userOperationHash}. Waiting for receipt...`);
+        const { receipt } = await bundlerClient!.waitForUserOperationReceipt({ hash: userOperationHash });
+        logger.info(`Execution completed, tx: ${receipt.transactionHash}`);
+
+        await logBalance(`Local EOA (${localAccount.address}) AFTER transfer`, provider, localAccount.address);
+        await logBalance('User Smart Account AFTER transfer', provider, userSmartAccount.address);
+    } catch (error: any) {
+        logger.error(`Error during user operation: ${error.message}`);
+        if (error.details) {
+            logger.error(`Error details: ${JSON.stringify(error.details, null, 2)}`);
+        }
+        throw error;
+    }
 }
 
 (async function main() {
