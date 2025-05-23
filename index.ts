@@ -23,7 +23,6 @@ import { baseSepolia } from 'viem/chains';
 import * as dotenv from 'dotenv';
 import winston, { Logger } from 'winston';
 import { getUserOperationHash } from 'viem/account-abstraction';
-import { ENTRY_POINT_ADDRESS } from './constants';
 
 // Import from the Porter Signer library
 import {
@@ -73,6 +72,7 @@ winston.addColors({
 
 dotenv.config();
 
+const ENTRY_POINT_ADDRESS = '0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789'; 
 const BASE_SEPOLIA_CHAIN_ID = 84532;
 const MULTISIG_CONTRACT_THRESHOLD = 2n; 
 const MULTISIG_ADDRESS = "0x42F30AEc1A36995eEFaf9536Eb62BD751F982D32" as Address;
@@ -130,19 +130,26 @@ async function setupEnvironment() {
         transport: http(process.env.RPC_URL)
     });
     
-    // const paymasterClient = createPaymasterClient({
-    //     transport: http(process.env.BUNDLER_URL)
-    // });
+    // Create bundler client with proper configuration
+    const bundlerClient = createBundlerClient({
+        transport: http(process.env.BUNDLER_URL),
+        chain: baseSepolia,
+    });
+
+    // Verify bundler is working
+    try {
+        await bundlerClient.getSupportedEntryPoints();
+        logger.info('Bundler connection successful');
+    } catch (error: any) {
+        logger.error('Failed to connect to bundler. Please ensure you are using a valid ERC-4337 bundler endpoint');
+        logger.error(`Error: ${error.message}`);
+        throw new Error('Invalid bundler configuration');
+    }
     
     const { createPimlicoClient } = await import("permissionless/clients/pimlico");
     const pimlicoClient = createPimlicoClient({ transport: http(process.env.BUNDLER_URL) });
     const {fast: fees} = await pimlicoClient.getUserOperationGasPrice();
     
-    const bundlerClient = createBundlerClient({
-        transport: http(process.env.BUNDLER_URL),
-        chain: baseSepolia,
-        // paymaster: paymasterClient,
-    });
     const localAccount = privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`);
     const eoaWallet = new ethers.Wallet(process.env.PRIVATE_KEY as string, provider);
 
@@ -198,7 +205,8 @@ async function executeViaMultisig({
     porterChecksums,
     bundlerClient,
     pimlicoClient,
-    threshold
+    threshold,
+    publicClient
 }: any) {
     logger.info('--- EXECUTING VIA MULTISIG ---');
 
@@ -209,7 +217,7 @@ async function executeViaMultisig({
     const executionData = {
         target: recipientAddress,
         value: transferAmount,
-        callData: '0x'
+        callData: '0x' as `0x${string}`
     };
 
     // Prepare the execution UserOperation
@@ -220,20 +228,51 @@ async function executeViaMultisig({
         const { fast: fee } = await pimlicoClient!.getUserOperationGasPrice();
         logger.debug(`Got gas price: maxFeePerGas=${fee.maxFeePerGas.toString()}, maxPriorityFeePerGas=${fee.maxPriorityFeePerGas.toString()}`);
 
-        // Prepare the user operation with gas parameters
-        const userOperation = await bundlerClient!.prepareUserOperation({
-            account: userSmartAccount,
-            calls: [executionData],
+        // Check if the account is deployed
+        const code = await publicClient.getBytecode({ address: userSmartAccount.address });
+        const isDeployed = code !== '0x';
+        logger.debug(`Smart account ${userSmartAccount.address} is ${isDeployed ? 'deployed' : 'not deployed'}`);
+
+        // Get nonce (0 if not deployed)
+        let nonce: bigint;
+        if (isDeployed) {
+            try {
+                nonce = await publicClient.readContract({
+                    address: userSmartAccount.address,
+                    abi: [{
+                        name: 'nonce',
+                        type: 'function',
+                        stateMutability: 'view',
+                        inputs: [],
+                        outputs: [{ type: 'uint256' }]
+                    }],
+                    functionName: 'nonce',
+                });
+            } catch (error) {
+                logger.warn('Failed to read nonce from contract, defaulting to 0');
+                nonce = 0n;
+            }
+        } else {
+            nonce = 0n;
+            logger.debug(`Using initCode: ${userSmartAccount.initCode}`);
+        }
+
+        // Manually construct the user operation
+        const userOperation = {
+            sender: userSmartAccount.address,
+            nonce,
+            initCode: isDeployed ? '0x' as `0x${string}` : userSmartAccount.initCode,
+            callData: executionData.callData,
+            callGasLimit: 500000n,
+            verificationGasLimit: 500000n,
+            preVerificationGas: 500000n,
             maxFeePerGas: fee.maxFeePerGas,
             maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
-            // Set minimum gas limits
-            callGasLimit: 100000n,
-            preVerificationGas: 100000n,
-            verificationGasLimit: 100000n
-        });
-        logger.debug(`Prepared user operation: sender=${userOperation.sender}, nonce=${userOperation.nonce.toString()}, initCode=${userOperation.initCode}, callData=${userOperation.callData}, callGasLimit=${userOperation.callGasLimit.toString()}, verificationGasLimit=${userOperation.verificationGasLimit.toString()}, preVerificationGas=${userOperation.preVerificationGas.toString()}, maxFeePerGas=${userOperation.maxFeePerGas.toString()}, maxPriorityFeePerGas=${userOperation.maxPriorityFeePerGas.toString()}, paymasterAndData=${userOperation.paymasterAndData}`);
+            paymasterAndData: '0x' as `0x${string}`,
+            signature: '0x' as `0x${string}` // Placeholder, will be replaced after signing
+        };
 
-        // Get the user operation hash using viem's utility function
+        // Get the user operation hash
         const userOpHash = getUserOperationHash({
             userOperation,
             entryPointAddress: ENTRY_POINT_ADDRESS as Address,
@@ -253,6 +292,11 @@ async function executeViaMultisig({
         logger.debug(`Got signatures from Porter: ${JSON.stringify(porterSignatures)}`);
         logger.debug(`Claimed signers: ${claimedSigners.join(', ')}`);
 
+        // Verify we have enough signatures
+        if (Object.keys(porterSignatures).length < Number(threshold)) {
+            throw new Error(`Not enough signatures. Required: ${threshold}, Got: ${Object.keys(porterSignatures).length}`);
+        }
+
         // Aggregate the signatures using the MultiSig format (sorted and concatenated)
         const sortedSignaturePairs = Object.entries(porterSignatures)
             .sort(([_, [addr1]], [__, [addr2]]) => 
@@ -266,16 +310,43 @@ async function executeViaMultisig({
         // Send the UserOperation with the aggregated signature
         logger.debug(`Sending user operation with signature...`);
         
-        const userOperationHash = await bundlerClient!.sendUserOperation({
-            ...userOperation,
-            signature: aggregatedSignature,
-        });
-        logger.verbose(`Execution UserOp sent: ${userOperationHash}. Waiting for receipt...`);
-        const { receipt } = await bundlerClient!.waitForUserOperationReceipt({ hash: userOperationHash });
-        logger.info(`Execution completed, tx: ${receipt.transactionHash}`);
+        try {
+            const userOperationHash = await bundlerClient!.sendUserOperation({
+                ...userOperation,
+                signature: aggregatedSignature,
+            });
+            logger.verbose(`Execution UserOp sent: ${userOperationHash}. Waiting for receipt...`);
+            const { receipt } = await bundlerClient!.waitForUserOperationReceipt({ hash: userOperationHash });
+            logger.info(`Execution completed, tx: ${receipt.transactionHash}`);
 
-        await logBalance(`Local EOA (${localAccount.address}) AFTER transfer`, provider, localAccount.address);
-        await logBalance('User Smart Account AFTER transfer', provider, userSmartAccount.address);
+            // Verify the signature after the operation is sent
+            try {
+                const isValid = await verifySignaturesOnChainViaEIP1271(
+                    provider,
+                    userSmartAccount.address,
+                    userOpHash,
+                    aggregatedSignature
+                );
+                if (!isValid) {
+                    logger.warn('Signature verification failed after operation was sent');
+                } else {
+                    logger.info('Signature verification successful');
+                }
+            } catch (error: any) {
+                logger.warn('Failed to verify signature after operation was sent');
+                logger.warn(`Error: ${error.message}`);
+            }
+
+            await logBalance(`Local EOA (${localAccount.address}) AFTER transfer`, provider, localAccount.address);
+            await logBalance('User Smart Account AFTER transfer', provider, userSmartAccount.address);
+        } catch (error: any) {
+            logger.error('Failed to send user operation to bundler');
+            logger.error(`Error: ${error.message}`);
+            if (error.details) {
+                logger.error(`Error details: ${JSON.stringify(error.details, null, 2)}`);
+            }
+            throw new Error('Failed to send user operation');
+        }
     } catch (error: any) {
         logger.error(`Error during user operation: ${error.message}`);
         if (error.details) {
@@ -302,7 +373,8 @@ async function executeViaMultisig({
         await executeViaMultisig({
             ...env,
             userSmartAccount,
-            threshold
+            threshold,
+            publicClient: env.publicClient
         });
 
         logger.info('--- SCRIPT COMPLETE ---!');
