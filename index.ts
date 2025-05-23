@@ -12,7 +12,7 @@ import {
     toMetaMaskSmartAccount,
 } from '@metamask/delegation-toolkit';
 import { aggregateSignature } from '@metamask/delegation-utils';
-import { ethers } from 'ethers';
+import { ethers, TypedDataEncoder, keccak256, AbiCoder } from 'ethers';
 import { Address, createPublicClient, Hex, http, parseEther, zeroAddress } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { 
@@ -266,45 +266,108 @@ async function executeViaMultisig({
             callGasLimit: 500000n,
             verificationGasLimit: 500000n,
             preVerificationGas: 500000n,
-            maxFeePerGas: fee.maxFeePerGas,
-            maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
+            ...fee,
             paymasterAndData: '0x' as `0x${string}`,
             signature: '0x' as `0x${string}` // Placeholder, will be replaced after signing
         };
 
-        // Get the user operation hash
-        const userOpHash = getUserOperationHash({
-            userOperation,
-            entryPointAddress: ENTRY_POINT_ADDRESS as Address,
-            chainId: baseSepolia.id,
-            entryPointVersion: '0.6'
-        });
-        logger.debug(`Generated user operation hash: ${userOpHash}`);
+        // Create EIP-712 typed data for signing
+        const domain = {
+            name: "MultiSigDeleGator",
+            version: "1",
+            chainId: BASE_SEPOLIA_CHAIN_ID,
+            verifyingContract: userSmartAccount.address
+        };
+
+        const types = {
+            PackedUserOperation: [
+                { name: "sender", type: "address" },
+                { name: "nonce", type: "uint256" },
+                { name: "initCode", type: "bytes" },
+                { name: "callData", type: "bytes" },
+                { name: "accountGasLimits", type: "bytes32" },
+                { name: "preVerificationGas", type: "uint256" },
+                { name: "gasFees", type: "bytes32" },
+                { name: "paymasterAndData", type: "bytes" },
+                { name: "entryPoint", type: "address" },
+            ]
+        };
+
+        // Encode gas limits and fees
+        const abiCoder = new AbiCoder();
+        const accountGasLimits = keccak256(
+            abiCoder.encode(
+                ["uint256", "uint256"],
+                [userOperation.callGasLimit, userOperation.verificationGasLimit]
+            )
+        ) as `0x${string}`;
+
+        const gasFees = keccak256(
+            abiCoder.encode(
+                ["uint256", "uint256"],
+                [userOperation.maxFeePerGas, userOperation.maxPriorityFeePerGas]
+            )
+        ) as `0x${string}`;
+
+        const value = {
+            sender: userSmartAccount.address,
+            nonce,
+            initCode: userOperation.initCode,
+            callData: userOperation.callData,
+            accountGasLimits,
+            preVerificationGas: userOperation.preVerificationGas,
+            gasFees,
+            paymasterAndData: userOperation.paymasterAndData,
+            entryPoint: ENTRY_POINT_ADDRESS
+        };
+
+        const digest = TypedDataEncoder.hash(domain, types, value) as `0x${string}`;
+        logger.debug(`Generated EIP-712 digest: ${digest}`);
 
         // Get signatures from Porter for the execution UserOperation
         logger.debug(`Requesting signatures from Porter...`);
-        const { signatures: porterSignatures, claimedSigners } = await requestSignaturesFromPorter(
+        const { signatures: porterSignatures, claimedSigners, messageHash: porterHash } = await requestSignaturesFromPorter(
             PORTER_BASE_URL,
-            userOpHash,
+            digest,
             porterChecksums,
             Number(threshold)
         );
         logger.debug(`Got signatures from Porter: ${JSON.stringify(porterSignatures)}`);
         logger.debug(`Claimed signers: ${claimedSigners.join(', ')}`);
+        logger.debug(`Porter hash: ${porterHash}`);
+
+        // Verify the hash with EntryPoint contract
+        const entryPointContract = new ethers.Contract(ENTRY_POINT_ADDRESS, [
+            "function getUserOpHash(tuple(address sender, uint256 nonce, bytes initCode, bytes callData, uint256 callGasLimit, uint256 verificationGasLimit, uint256 preVerificationGas, uint256 maxFeePerGas, uint256 maxPriorityFeePerGas, bytes paymasterAndData, bytes signature) userOp) view returns (bytes32)"
+        ], provider);
+        
+        const onChainHash = await entryPointContract.getUserOpHash(userOperation);
+        logger.debug(`EntryPoint hash: ${onChainHash}`);
+        
+        // Verify all hashes match
+        if (onChainHash !== digest) {
+            throw new Error(`Hash mismatch: EIP-712=${digest}, onchain=${onChainHash}`);
+        }
+        if (porterHash !== digest) {
+            throw new Error(`Hash mismatch: porter=${porterHash}, EIP-712=${digest}`);
+        }
+        logger.info('All hashes verified: EIP-712, EntryPoint, and Porter match');
 
         // Verify we have enough signatures
         if (Object.keys(porterSignatures).length < Number(threshold)) {
             throw new Error(`Not enough signatures. Required: ${threshold}, Got: ${Object.keys(porterSignatures).length}`);
         }
 
-        // Aggregate the signatures using the MultiSig format (sorted and concatenated)
-        const sortedSignaturePairs = Object.entries(porterSignatures)
-            .sort(([_, [addr1]], [__, [addr2]]) => 
-                addr1.toLowerCase().localeCompare(addr2.toLowerCase())
-            );
+        // Aggregate the signatures using the MetaMask Delegation Toolkit
+        const signatureObjects = Object.entries(porterSignatures).map(([_, [signer, signature]]) => ({
+            signer: signer as `0x${string}`,
+            signature: signature as `0x${string}`,
+            type: "ECDSA" as const
+        }));
 
-        const sortedSignatures = sortedSignaturePairs.map(([_, [__, signature]]) => signature);
-        const aggregatedSignature = `0x${sortedSignatures.join('').slice(2)}` as Hex;
+        const aggregatedSignature = aggregateSignature({
+            signatures: signatureObjects
+        });
         logger.debug(`Aggregated signature: ${aggregatedSignature}`);
 
         // Send the UserOperation with the aggregated signature
@@ -324,7 +387,7 @@ async function executeViaMultisig({
                 const isValid = await verifySignaturesOnChainViaEIP1271(
                     provider,
                     userSmartAccount.address,
-                    userOpHash,
+                    digest,
                     aggregatedSignature
                 );
                 if (!isValid) {
