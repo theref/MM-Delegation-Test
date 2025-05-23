@@ -28,29 +28,14 @@ winston.addColors({ error: 'red', warn: 'yellow', info: 'green', verbose: 'cyan'
 export async function getPorterChecksums(porterBaseUrl: string, quantity: number = 3): Promise<Address[]> {
     logger.verbose(`Fetching ${quantity} Ursula checksums from Porter at ${porterBaseUrl}...`);
     
-    try {
-        const response = await fetch(`${porterBaseUrl}/get_ursulas?quantity=${quantity}`);
-        if (!response.ok) {
-            const errorText = await response.text();
-            logger.error(`Failed to fetch Ursulas: ${response.status} ${errorText}`);
-            throw new Error(`Failed to fetch Ursulas: ${response.status} ${errorText}`);
-        }
-        const data = await response.json();
-        if (!data.result?.ursulas) {
-            logger.error('Invalid response structure from Porter /get_ursulas. Response:', data);
-            throw new Error('Invalid response structure from Porter /get_ursulas');
-        }
-
-        const checksums = data.result.ursulas.map((ursula: any) => 
-            ursula.checksum_address.toLowerCase() as Address
-        );
+    const response = await fetch(`${porterBaseUrl}/get_ursulas?quantity=${quantity}`);
+    const data = await response.json();
+    const checksums = data.result.ursulas.map((ursula: any) => 
+        ursula.checksum_address.toLowerCase() as Address
+    );
         
-        logger.verbose(`Retrieved ${checksums.length} Ursula nodes: ${checksums.join(',')}`);
-        return checksums;
-    } catch (error: any) {
-        logger.error(`Error fetching Ursulas: ${error.message}`);
-        throw error;
-    }
+    logger.verbose(`Retrieved ${checksums.length} Ursula nodes: ${checksums.join(',')}`);
+    return checksums;
 }
 
 export async function requestSignaturesFromPorter(
@@ -71,20 +56,10 @@ export async function requestSignaturesFromPorter(
     const requestB64 = Buffer.from(JSON.stringify(requestData)).toString('base64');
 
     const signingRequests = ursulaChecksums.reduce((acc, checksum) => {
-        if (checksum && typeof checksum === 'string') {
-            acc[checksum] = requestB64;
-        } else {
-            logger.warn(`Skipping invalid Ursula address: ${checksum}`);
-        }
+        acc[checksum] = requestB64;
         return acc;
     }, {} as { [key: string]: string });
     
-    if (Object.keys(signingRequests).length < porterThreshold) {
-        const errMsg = `Not enough valid Ursula checksums (${Object.keys(signingRequests).length}) for threshold (${porterThreshold})`;
-        logger.error(errMsg);
-        throw new Error(errMsg);
-    }
-
     const requestBody = { signing_requests: signingRequests, threshold: porterThreshold };
     logger.debug(`Porter /sign request body: ${JSON.stringify(requestBody, null, 2)}`);
 
@@ -103,34 +78,14 @@ export async function requestSignaturesFromPorter(
     const result = await response.json();
     logger.debug(`Porter /sign response: ${JSON.stringify(result, null, 2)}`);
 
-    if (!result.result?.signing_results?.signatures || Object.keys(result.result.signing_results.signatures).length === 0) {
-        logger.error("No signatures in Porter response", result);
-        throw new Error("No signatures in Porter response");
-    }
     
     const receivedSignatures: { [checksumAddress: string]: [string, string] } = {};
-    let messageHash: string | undefined;
+    let messageHash = '';
 
     for (const [ursulaAddress, [signerAddress, signatureB64]] of Object.entries(result.result.signing_results.signatures) as [string, [string, string]][]) {
-        const decodedData = JSON.parse(Buffer.from(signatureB64, 'base64').toString()) as { 
-            message_hash: string; 
-            signature: string 
-        };
-        
-        if (!messageHash) {
-            messageHash = decodedData.message_hash;
-        } else if (messageHash !== decodedData.message_hash) {
-            logger.warn(`Message hash mismatch for ${ursulaAddress}. Expected ${messageHash}, got ${decodedData.message_hash}`);
-        }
-        
-        const formattedSignature = `0x${decodedData.signature}`;
-        logger.debug(`Signature from ${ursulaAddress}: ${formattedSignature}`);
-        
-        receivedSignatures[ursulaAddress] = [signerAddress, formattedSignature];
-    }
-
-    if (!messageHash) {
-        throw new Error("No message hash in Porter response");
+        const decodedData = JSON.parse(Buffer.from(signatureB64, 'base64').toString());
+        messageHash = decodedData.message_hash;
+        receivedSignatures[ursulaAddress] = [signerAddress, `0x${decodedData.signature}`];
     }
 
     const claimedSigners = Object.values(receivedSignatures)
@@ -138,12 +93,6 @@ export async function requestSignaturesFromPorter(
     
     logger.verbose(`Porter claimed signers: ${claimedSigners.join(',')}`);
     
-    if (claimedSigners.length < porterThreshold) {
-        const errMsg = `Insufficient signatures (${claimedSigners.length}) for threshold (${porterThreshold})`;
-        logger.error(errMsg);
-        throw new Error(errMsg);
-    }
-
     logger.verbose(`Message hash: ${messageHash}`);
     return { signatures: receivedSignatures, claimedSigners, messageHash };
 }
@@ -158,11 +107,7 @@ export function aggregatePorterSignatures(
             addr1.toLowerCase().localeCompare(addr2.toLowerCase())
         );
 
-    const sortedSignatures = sortedSignaturePairs.map(([ursulaAddress, [signerAddress, signature]]) => {
-        logger.debug(`Processing signature from ${ursulaAddress} (signer: ${signerAddress})`);
-        return signature as Hex;
-    });
-
+    const sortedSignatures = sortedSignaturePairs.map(([_, [__, signature]]) => signature as Hex);
     logger.debug(`Sorted signatures: ${JSON.stringify(sortedSignatures)}`);
     const combined = concat(sortedSignatures);
     logger.verbose(`Combined signature (${combined.length / 2 - 1} bytes): ${combined}`);
