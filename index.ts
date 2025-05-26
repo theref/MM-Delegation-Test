@@ -330,7 +330,8 @@ async function executeViaMultisig({
             PORTER_BASE_URL,
             digest,
             porterChecksums,
-            Number(threshold)
+            Number(threshold),
+            BASE_SEPOLIA_CHAIN_ID
         );
         logger.debug(`Got signatures from Porter: ${JSON.stringify(porterSignatures)}`);
         logger.debug(`Claimed signers: ${claimedSigners.join(', ')}`);

@@ -43,7 +43,8 @@ export async function requestSignaturesFromPorter(
     dataToSign: Hex,
     ursulaChecksums: Address[],
     porterThreshold: number,
-    cohortId: number = 0,
+    chainId: number,
+    cohortId: number = 1,
     context: object = {}
 ): Promise<{ 
     signatures: { [checksumAddress: string]: [string, string] }; 
@@ -52,7 +53,7 @@ export async function requestSignaturesFromPorter(
 }> {
     logger.debug(`Requesting signatures from Ursulas: ${ursulaChecksums.join(', ')}`);
 
-    const requestData = { data_to_sign: dataToSign, cohort_id: cohortId, context };
+    const requestData = { data_to_sign: dataToSign, chain_id: chainId, cohort_id: cohortId, context: context };
     const requestB64 = Buffer.from(JSON.stringify(requestData)).toString('base64');
 
     const signingRequests = ursulaChecksums.reduce((acc, checksum) => {
