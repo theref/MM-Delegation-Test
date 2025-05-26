@@ -72,7 +72,13 @@ winston.addColors({
 
 dotenv.config();
 
-const ENTRY_POINT_ADDRESS = '0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789'; 
+// toggle this flag accordingly
+const USE_OLD_ENTRY_POINT = false;
+var ENTRY_POINT_ADDRESS = '0x0000000071727De22E5E9d8BAf0edAc6f37da032';
+if (USE_OLD_ENTRY_POINT) {
+    ENTRY_POINT_ADDRESS = '0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789';
+}
+
 const BASE_SEPOLIA_CHAIN_ID = 84532;
 const MULTISIG_CONTRACT_THRESHOLD = 2n; 
 const MULTISIG_ADDRESS = "0x42F30AEc1A36995eEFaf9536Eb62BD751F982D32" as Address;
@@ -232,6 +238,7 @@ async function executeViaMultisig({
         const code = await publicClient.getBytecode({ address: userSmartAccount.address });
         const isDeployed = code !== '0x';
         logger.debug(`Smart account ${userSmartAccount.address} is ${isDeployed ? 'deployed' : 'not deployed'}`);
+        logger.debug(`EntryPoint contract ${ENTRY_POINT_ADDRESS}`);
 
         // Get nonce (0 if not deployed)
         let nonce: bigint;
@@ -289,7 +296,7 @@ async function executeViaMultisig({
                 { name: "preVerificationGas", type: "uint256" },
                 { name: "gasFees", type: "bytes32" },
                 { name: "paymasterAndData", type: "bytes" },
-                { name: "entryPoint", type: "address" },
+                { name: "signature", type: "bytes"}
             ]
         };
 
@@ -309,7 +316,7 @@ async function executeViaMultisig({
             )
         ) as `0x${string}`;
 
-        const value = {
+        const packedUserOp = {
             sender: userSmartAccount.address,
             nonce,
             initCode: userOperation.initCode,
@@ -318,11 +325,60 @@ async function executeViaMultisig({
             preVerificationGas: userOperation.preVerificationGas,
             gasFees,
             paymasterAndData: userOperation.paymasterAndData,
-            entryPoint: ENTRY_POINT_ADDRESS
+            signature: userOperation.signature
         };
 
-        const digest = TypedDataEncoder.hash(domain, types, value) as `0x${string}`;
-        logger.debug(`Generated EIP-712 digest: ${digest}`);
+        var userOpDigest = '0x';
+        if(USE_OLD_ENTRY_POINT) {
+            // User op hash
+            userOpDigest = keccak256(abiCoder.encode(
+                [
+                  "address", "uint256", "bytes32", "bytes32",
+                  "uint256", "uint256", "uint256", "uint256", "uint256",
+                  "bytes32"
+                ],
+                [
+                  userOperation.sender,
+                  userOperation.nonce,
+                  keccak256(userOperation.initCode),
+                  keccak256(userOperation.callData),
+                  userOperation.callGasLimit,
+                  userOperation.verificationGasLimit,
+                  userOperation.preVerificationGas,
+                  userOperation.maxFeePerGas,
+                  userOperation.maxPriorityFeePerGas,
+                  keccak256(userOperation.paymasterAndData),
+                ]
+            ));
+        } else {
+            // packedUserOp
+            userOpDigest = keccak256(abiCoder.encode(
+                [
+                  "address", "uint256", "bytes32", "bytes32",
+                  "bytes32", "uint256", "bytes32", "bytes32"
+                ],
+                [
+                  packedUserOp.sender,
+                  packedUserOp.nonce,
+                  keccak256(packedUserOp.initCode),
+                  keccak256(packedUserOp.callData),
+                  packedUserOp.accountGasLimits,
+                  packedUserOp.preVerificationGas,
+                  packedUserOp.gasFees,
+                  keccak256(packedUserOp.paymasterAndData),
+                ]
+            ));
+        }
+        const localDigest = keccak256(
+            abiCoder.encode([
+                "bytes32", "address", "uint256"],
+                [userOpDigest, ENTRY_POINT_ADDRESS, BASE_SEPOLIA_CHAIN_ID]
+            )
+        );
+        logger.debug(`Generated local hash: ${localDigest}`);
+
+        const digest = TypedDataEncoder.hash(domain, types, packedUserOp) as `0x${string}`;
+        logger.debug(`Generated EIP-712 hash: ${digest}`);
 
         // Get signatures from Porter for the execution UserOperation
         logger.debug(`Requesting signatures from Porter...`);
@@ -339,20 +395,25 @@ async function executeViaMultisig({
 
         // Verify the hash with EntryPoint contract
         const entryPointContract = new ethers.Contract(ENTRY_POINT_ADDRESS, [
+            USE_OLD_ENTRY_POINT ?
             "function getUserOpHash(tuple(address sender, uint256 nonce, bytes initCode, bytes callData, uint256 callGasLimit, uint256 verificationGasLimit, uint256 preVerificationGas, uint256 maxFeePerGas, uint256 maxPriorityFeePerGas, bytes paymasterAndData, bytes signature) userOp) view returns (bytes32)"
+            : "function getUserOpHash(tuple(address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature) userOp) view returns (bytes32)"
         ], provider);
         
-        const onChainHash = await entryPointContract.getUserOpHash(userOperation);
+        const onChainHash = await entryPointContract.getUserOpHash(USE_OLD_ENTRY_POINT ? userOperation : packedUserOp);
         logger.debug(`EntryPoint hash: ${onChainHash}`);
-        
+
         // Verify all hashes match
+        if (onChainHash !== localDigest) {
+            throw new Error(`Hash mismatch: local=${localDigest}, onchain=${onChainHash}`);
+        }
         if (onChainHash !== digest) {
             throw new Error(`Hash mismatch: EIP-712=${digest}, onchain=${onChainHash}`);
         }
         if (porterHash !== digest) {
             throw new Error(`Hash mismatch: porter=${porterHash}, EIP-712=${digest}`);
         }
-        logger.info('All hashes verified: EIP-712, EntryPoint, and Porter match');
+        logger.info('All hashes verified: Local, EIP-712, EntryPoint, and Porter match');
 
         // Verify we have enough signatures
         if (Object.keys(porterSignatures).length < Number(threshold)) {
