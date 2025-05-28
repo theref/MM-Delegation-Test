@@ -73,11 +73,7 @@ winston.addColors({
 dotenv.config();
 
 // toggle this flag accordingly
-const USE_OLD_ENTRY_POINT = false;
-var ENTRY_POINT_ADDRESS = '0x0000000071727De22E5E9d8BAf0edAc6f37da032';
-if (USE_OLD_ENTRY_POINT) {
-    ENTRY_POINT_ADDRESS = '0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789';
-}
+var ENTRY_POINT_ADDRESS = "0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108" as Address; // v_0_8
 
 const BASE_SEPOLIA_CHAIN_ID = 84532;
 const MULTISIG_CONTRACT_THRESHOLD = 2n; 
@@ -278,28 +274,6 @@ async function executeViaMultisig({
             signature: '0x' as `0x${string}` // Placeholder, will be replaced after signing
         };
 
-        // Create EIP-712 typed data for signing
-        const domain = {
-            name: "MultiSigDeleGator",
-            version: "1",
-            chainId: BASE_SEPOLIA_CHAIN_ID,
-            verifyingContract: userSmartAccount.address
-        };
-
-        const types = {
-            PackedUserOperation: [
-                { name: "sender", type: "address" },
-                { name: "nonce", type: "uint256" },
-                { name: "initCode", type: "bytes" },
-                { name: "callData", type: "bytes" },
-                { name: "accountGasLimits", type: "bytes32" },
-                { name: "preVerificationGas", type: "uint256" },
-                { name: "gasFees", type: "bytes32" },
-                { name: "paymasterAndData", type: "bytes" },
-                { name: "signature", type: "bytes"}
-            ]
-        };
-
         // Encode gas limits and fees
         const abiCoder = new AbiCoder();
         const accountGasLimits = keccak256(
@@ -307,14 +281,14 @@ async function executeViaMultisig({
                 ["uint256", "uint256"],
                 [userOperation.callGasLimit, userOperation.verificationGasLimit]
             )
-        ) as `0x${string}`;
+        );
 
         const gasFees = keccak256(
             abiCoder.encode(
                 ["uint256", "uint256"],
                 [userOperation.maxFeePerGas, userOperation.maxPriorityFeePerGas]
             )
-        ) as `0x${string}`;
+        );
 
         const packedUserOp = {
             sender: userSmartAccount.address,
@@ -327,56 +301,26 @@ async function executeViaMultisig({
             paymasterAndData: userOperation.paymasterAndData,
             signature: userOperation.signature
         };
-
-        var userOpDigest = '0x';
-        if(USE_OLD_ENTRY_POINT) {
-            // User op hash
-            userOpDigest = keccak256(abiCoder.encode(
-                [
-                  "address", "uint256", "bytes32", "bytes32",
-                  "uint256", "uint256", "uint256", "uint256", "uint256",
-                  "bytes32"
-                ],
-                [
-                  userOperation.sender,
-                  userOperation.nonce,
-                  keccak256(userOperation.initCode),
-                  keccak256(userOperation.callData),
-                  userOperation.callGasLimit,
-                  userOperation.verificationGasLimit,
-                  userOperation.preVerificationGas,
-                  userOperation.maxFeePerGas,
-                  userOperation.maxPriorityFeePerGas,
-                  keccak256(userOperation.paymasterAndData),
-                ]
-            ));
-        } else {
-            // packedUserOp
-            userOpDigest = keccak256(abiCoder.encode(
-                [
-                  "address", "uint256", "bytes32", "bytes32",
-                  "bytes32", "uint256", "bytes32", "bytes32"
-                ],
-                [
-                  packedUserOp.sender,
-                  packedUserOp.nonce,
-                  keccak256(packedUserOp.initCode),
-                  keccak256(packedUserOp.callData),
-                  packedUserOp.accountGasLimits,
-                  packedUserOp.preVerificationGas,
-                  packedUserOp.gasFees,
-                  keccak256(packedUserOp.paymasterAndData),
-                ]
-            ));
-        }
-        const localDigest = keccak256(
-            abiCoder.encode([
-                "bytes32", "address", "uint256"],
-                [userOpDigest, ENTRY_POINT_ADDRESS, BASE_SEPOLIA_CHAIN_ID]
-            )
-        );
-        logger.debug(`Generated local hash: ${localDigest}`);
-
+        
+        // Create EIP-712 typed data for signing
+        const domain = {
+            name: "ERC4337",
+            version: "1",
+            chainId: BASE_SEPOLIA_CHAIN_ID,
+            verifyingContract: ENTRY_POINT_ADDRESS
+        };
+        const types = {
+            PackedUserOperation: [
+                { name: "sender", type: "address" },
+                { name: "nonce", type: "uint256" },
+                { name: "initCode", type: "bytes" },
+                { name: "callData", type: "bytes" },
+                { name: "accountGasLimits", type: "bytes32" },
+                { name: "preVerificationGas", type: "uint256" },
+                { name: "gasFees", type: "bytes32" },
+                { name: "paymasterAndData", type: "bytes" }
+            ]
+        };
         const digest = TypedDataEncoder.hash(domain, types, packedUserOp) as `0x${string}`;
         logger.debug(`Generated EIP-712 hash: ${digest}`);
 
@@ -395,18 +339,13 @@ async function executeViaMultisig({
 
         // Verify the hash with EntryPoint contract
         const entryPointContract = new ethers.Contract(ENTRY_POINT_ADDRESS, [
-            USE_OLD_ENTRY_POINT ?
-            "function getUserOpHash(tuple(address sender, uint256 nonce, bytes initCode, bytes callData, uint256 callGasLimit, uint256 verificationGasLimit, uint256 preVerificationGas, uint256 maxFeePerGas, uint256 maxPriorityFeePerGas, bytes paymasterAndData, bytes signature) userOp) view returns (bytes32)"
-            : "function getUserOpHash(tuple(address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature) userOp) view returns (bytes32)"
+            "function getUserOpHash(tuple(address sender,uint256 nonce,bytes initCode,bytes callData,bytes32 accountGasLimits,uint256 preVerificationGas,bytes32 gasFees,bytes paymasterAndData,bytes signature) userOp) view returns (bytes32)"
         ], provider);
         
-        const onChainHash = await entryPointContract.getUserOpHash(USE_OLD_ENTRY_POINT ? userOperation : packedUserOp);
+        const onChainHash = await entryPointContract.getUserOpHash(packedUserOp);
         logger.debug(`EntryPoint hash: ${onChainHash}`);
 
         // Verify all hashes match
-        if (onChainHash !== localDigest) {
-            throw new Error(`Hash mismatch: local=${localDigest}, onchain=${onChainHash}`);
-        }
         if (onChainHash !== digest) {
             throw new Error(`Hash mismatch: EIP-712=${digest}, onchain=${onChainHash}`);
         }
