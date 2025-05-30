@@ -11,9 +11,9 @@ import {
     Implementation,
     toMetaMaskSmartAccount,
 } from '@metamask/delegation-toolkit';
-import { aggregateSignature } from '@metamask/delegation-utils';
+import { aggregateSignature, createUserOpHashV07, DeleGatorEnvironment, getDeleGatorEnvironment, packUserOp, SIGNABLE_USER_OP_TYPED_DATA } from '@metamask/delegation-utils';
 import { ethers, TypedDataEncoder, keccak256, AbiCoder } from 'ethers';
-import { Address, createPublicClient, Hex, http, parseEther, zeroAddress } from 'viem';
+import { Address, createPublicClient, Hex, http, parseEther, toHex, zeroAddress } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { 
     createPaymasterClient,
@@ -22,13 +22,11 @@ import {
 import { baseSepolia } from 'viem/chains';
 import * as dotenv from 'dotenv';
 import winston, { Logger } from 'winston';
-import { getUserOperationHash } from 'viem/account-abstraction';
 
 // Import from the Porter Signer library
 import {
     getPorterChecksums as getPorterChecksumsFromLibrary, 
     requestSignaturesFromPorter,
-    aggregatePorterSignatures,
     verifySignaturesOnChainViaEIP1271
 } from './porter_signer';
 
@@ -73,10 +71,10 @@ winston.addColors({
 dotenv.config();
 
 // toggle this flag accordingly
-var ENTRY_POINT_ADDRESS = "0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108" as Address; // v_0_8
+var ENTRY_POINT_ADDRESS = "0x0000000071727De22E5E9d8BAf0edAc6f37da032" as Address; // v_0_7 (currently used by MDT)
 
 const BASE_SEPOLIA_CHAIN_ID = 84532;
-const MULTISIG_CONTRACT_THRESHOLD = 2n; 
+const MULTISIG_CONTRACT_THRESHOLD = 2;
 const MULTISIG_ADDRESS = "0x42F30AEc1A36995eEFaf9536Eb62BD751F982D32" as Address;
 const PORTER_BASE_URL = "https://porter-lynx.nucypher.io";
 
@@ -131,10 +129,16 @@ async function setupEnvironment() {
         chain: baseSepolia,
         transport: http(process.env.RPC_URL)
     });
+
+    const paymasterClient = createPaymasterClient({
+        transport: http(process.env.BUNDLER_URL)
+    });
     
     // Create bundler client with proper configuration
     const bundlerClient = createBundlerClient({
+        // client: publicClient,
         transport: http(process.env.BUNDLER_URL),
+        // paymaster: paymasterClient,
         chain: baseSepolia,
     });
 
@@ -196,6 +200,9 @@ async function deployAndSetupSmartAccount({
         }]
     });
 
+    const environment: DeleGatorEnvironment = getDeleGatorEnvironment(BASE_SEPOLIA_CHAIN_ID);
+    logger.debug(`>>>> environment ${JSON.stringify(environment)}`);
+
     return { userSmartAccount, threshold };
 }
 
@@ -237,7 +244,7 @@ async function executeViaMultisig({
         logger.debug(`EntryPoint contract ${ENTRY_POINT_ADDRESS}`);
 
         // Get nonce (0 if not deployed)
-        let nonce: bigint;
+        let nonce: number;
         if (isDeployed) {
             try {
                 nonce = await publicClient.readContract({
@@ -253,82 +260,43 @@ async function executeViaMultisig({
                 });
             } catch (error) {
                 logger.warn('Failed to read nonce from contract, defaulting to 0');
-                nonce = 0n;
+                nonce = 0;
             }
         } else {
-            nonce = 0n;
+            nonce = 0;
             logger.debug(`Using initCode: ${userSmartAccount.initCode}`);
         }
 
-        // Manually construct the user operation
-        const userOperation = {
-            sender: userSmartAccount.address,
-            nonce,
-            initCode: isDeployed ? '0x' as `0x${string}` : userSmartAccount.initCode,
-            callData: executionData.callData,
-            callGasLimit: 500000n,
-            verificationGasLimit: 500000n,
-            preVerificationGas: 500000n,
-            ...fee,
-            paymasterAndData: '0x' as `0x${string}`,
-            signature: '0x' as `0x${string}` // Placeholder, will be replaced after signing
-        };
+        // Construct the user operation
+        const userOperation = await bundlerClient!.prepareUserOperation({
+            account: userSmartAccount,
+            calls: [
+                {
+                  target: zeroAddress,
+                  value: 0n,
+                  data: "0x",
+                }
+              ],
+            ...fee
+        });
 
-        // Encode gas limits and fees
-        const abiCoder = new AbiCoder();
-        const accountGasLimits = keccak256(
-            abiCoder.encode(
-                ["uint256", "uint256"],
-                [userOperation.callGasLimit, userOperation.verificationGasLimit]
-            )
-        );
-
-        const gasFees = keccak256(
-            abiCoder.encode(
-                ["uint256", "uint256"],
-                [userOperation.maxFeePerGas, userOperation.maxPriorityFeePerGas]
-            )
-        );
-
-        const packedUserOp = {
-            sender: userSmartAccount.address,
-            nonce,
-            initCode: userOperation.initCode,
-            callData: userOperation.callData,
-            accountGasLimits,
-            preVerificationGas: userOperation.preVerificationGas,
-            gasFees,
-            paymasterAndData: userOperation.paymasterAndData,
-            signature: userOperation.signature
-        };
-        
-        // Create EIP-712 typed data for signing
-        const domain = {
-            name: "ERC4337",
-            version: "1",
-            chainId: BASE_SEPOLIA_CHAIN_ID,
-            verifyingContract: ENTRY_POINT_ADDRESS
-        };
-        const types = {
-            PackedUserOperation: [
-                { name: "sender", type: "address" },
-                { name: "nonce", type: "uint256" },
-                { name: "initCode", type: "bytes" },
-                { name: "callData", type: "bytes" },
-                { name: "accountGasLimits", type: "bytes32" },
-                { name: "preVerificationGas", type: "uint256" },
-                { name: "gasFees", type: "bytes32" },
-                { name: "paymasterAndData", type: "bytes" }
-            ]
-        };
-        const digest = TypedDataEncoder.hash(domain, types, packedUserOp) as `0x${string}`;
-        logger.debug(`Generated EIP-712 hash: ${digest}`);
+        const packedUserOp = packUserOp(userOperation);
+        logger.debug(">>> PackedUserOp");
+        logger.debug(`> sender: ${packedUserOp.sender}`);
+        logger.debug(`> nonce: ${packedUserOp.nonce}`);
+        logger.debug(`> initCode: ${packedUserOp.initCode}`);
+        logger.debug(`> callData: ${packedUserOp.callData}`);
+        logger.debug(`> accounGasLimits: ${packedUserOp.accountGasLimits}`);
+        logger.debug(`> preVerificationGas: ${packedUserOp.preVerificationGas}`);
+        logger.debug(`> gasFees: ${packedUserOp.gasFees}`);
+        logger.debug(`> paymasterAndData: ${packedUserOp.paymasterAndData}`);
+        logger.debug(`> signature: ${packedUserOp.signature}`);
 
         // Get signatures from Porter for the execution UserOperation
         logger.debug(`Requesting signatures from Porter...`);
         const { signatures: porterSignatures, claimedSigners, messageHash: porterHash } = await requestSignaturesFromPorter(
             PORTER_BASE_URL,
-            digest,
+            packedUserOp,
             porterChecksums,
             Number(threshold),
             BASE_SEPOLIA_CHAIN_ID
@@ -336,24 +304,6 @@ async function executeViaMultisig({
         logger.debug(`Got signatures from Porter: ${JSON.stringify(porterSignatures)}`);
         logger.debug(`Claimed signers: ${claimedSigners.join(', ')}`);
         logger.debug(`Porter hash: ${porterHash}`);
-
-        // Verify the hash with EntryPoint contract
-        const entryPointContract = new ethers.Contract(ENTRY_POINT_ADDRESS, [
-            "function getUserOpHash(tuple(address sender,uint256 nonce,bytes initCode,bytes callData,bytes32 accountGasLimits,uint256 preVerificationGas,bytes32 gasFees,bytes paymasterAndData,bytes signature) userOp) view returns (bytes32)"
-        ], provider);
-        
-        const onChainHash = await entryPointContract.getUserOpHash(packedUserOp);
-        logger.debug(`EntryPoint hash: ${onChainHash}`);
-
-        // Verify all hashes match
-        if (onChainHash !== digest) {
-            throw new Error(`Hash mismatch: EIP-712=${digest}, onchain=${onChainHash}`);
-        }
-        if (porterHash !== digest) {
-            throw new Error(`Hash mismatch: porter=${porterHash}, EIP-712=${digest}`);
-        }
-        logger.info('All hashes verified: Local, EIP-712, EntryPoint, and Porter match');
-
         // Verify we have enough signatures
         if (Object.keys(porterSignatures).length < Number(threshold)) {
             throw new Error(`Not enough signatures. Required: ${threshold}, Got: ${Object.keys(porterSignatures).length}`);
@@ -388,7 +338,7 @@ async function executeViaMultisig({
                 const isValid = await verifySignaturesOnChainViaEIP1271(
                     provider,
                     userSmartAccount.address,
-                    digest,
+                    porterHash as `0x${string}`,
                     aggregatedSignature
                 );
                 if (!isValid) {

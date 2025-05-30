@@ -25,6 +25,21 @@ const logger: Logger = winston.createLogger({
 });
 winston.addColors({ error: 'red', warn: 'yellow', info: 'green', verbose: 'cyan', debug: 'gray' });
 
+// Convert camelCase to snake_case
+function toSnakeCase(str: string): string {
+    return str.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
+}
+
+// Convert only object keys to snake_case, preserving values
+function convertToSnakeCase(obj: Record<string, any>): Record<string, any> {
+    return Object.fromEntries(
+        Object.entries(obj).map(([key, value]) => [
+            toSnakeCase(key),
+            typeof value === 'bigint' ? Number(value) : value
+        ])
+    );
+}
+
 export async function getPorterChecksums(porterBaseUrl: string, quantity: number = 3): Promise<Address[]> {
     logger.verbose(`Fetching ${quantity} Ursula checksums from Porter at ${porterBaseUrl}...`);
     
@@ -40,7 +55,7 @@ export async function getPorterChecksums(porterBaseUrl: string, quantity: number
 
 export async function requestSignaturesFromPorter(
     porterBaseUrl: string,
-    dataToSign: Hex,
+    packedUserOperation: Record<string, any>,
     ursulaChecksums: Address[],
     porterThreshold: number,
     chainId: number,
@@ -53,7 +68,18 @@ export async function requestSignaturesFromPorter(
 }> {
     logger.debug(`Requesting signatures from Ursulas: ${ursulaChecksums.join(', ')}`);
 
-    const requestData = { data_to_sign: dataToSign, chain_id: chainId, cohort_id: cohortId, context: context };
+    // Convert userOperation to snake_case
+    const snakeCaseUserOp = convertToSnakeCase(packedUserOperation);
+    const packed_user_op_json = JSON.stringify(snakeCaseUserOp);
+
+    const requestData = {
+        signature_type: 'packedUserOp',
+        aa_version: 'mdt',
+        packed_user_op: packed_user_op_json,
+        cohort_id: cohortId,
+        chain_id: chainId,
+        context: context
+    };
     const requestB64 = Buffer.from(JSON.stringify(requestData)).toString('base64');
 
     const signingRequests = ursulaChecksums.reduce((acc, checksum) => {
@@ -79,14 +105,13 @@ export async function requestSignaturesFromPorter(
     const result = await response.json();
     logger.debug(`Porter /sign response: ${JSON.stringify(result, null, 2)}`);
 
-    
     const receivedSignatures: { [checksumAddress: string]: [string, string] } = {};
     let messageHash = '';
 
     for (const [ursulaAddress, [signerAddress, signatureB64]] of Object.entries(result.result.signing_results.signatures) as [string, [string, string]][]) {
         const decodedData = JSON.parse(Buffer.from(signatureB64, 'base64').toString());
         messageHash = decodedData.message_hash;
-        receivedSignatures[ursulaAddress] = [signerAddress, `0x${decodedData.signature}`];
+        receivedSignatures[ursulaAddress] = [signerAddress, decodedData.signature];
     }
 
     const claimedSigners = Object.values(receivedSignatures)
