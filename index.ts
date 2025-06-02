@@ -138,7 +138,7 @@ async function setupEnvironment() {
     const bundlerClient = createBundlerClient({
         // client: publicClient,
         transport: http(process.env.BUNDLER_URL),
-        // paymaster: paymasterClient,
+        paymaster: paymasterClient,
         chain: baseSepolia,
     });
 
@@ -277,7 +277,8 @@ async function executeViaMultisig({
                   data: "0x",
                 }
               ],
-            ...fee
+            ...fee,
+            verificationGasLimit: 500_000
         });
 
         const packedUserOp = packUserOp(userOperation);
