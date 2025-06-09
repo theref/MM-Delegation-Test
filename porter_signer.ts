@@ -55,7 +55,7 @@ export async function getPorterChecksums(porterBaseUrl: string, quantity: number
 
 export async function requestSignaturesFromPorter(
     porterBaseUrl: string,
-    packedUserOperation: Record<string, any>,
+    userOperation: Record<string, any>,
     ursulaChecksums: Address[],
     porterThreshold: number,
     chainId: number,
@@ -69,18 +69,20 @@ export async function requestSignaturesFromPorter(
     logger.debug(`Requesting signatures from Ursulas: ${ursulaChecksums.join(', ')}`);
 
     // Convert userOperation to snake_case
-    const snakeCaseUserOp = convertToSnakeCase(packedUserOperation);
-    const packed_user_op_json = JSON.stringify(snakeCaseUserOp);
+    const snakeCaseUserOp = convertToSnakeCase(userOperation);
+    const user_op_json = JSON.stringify(snakeCaseUserOp);
 
     const requestData = {
-        signature_type: 'packedUserOp',
+        signature_type: 'userop',
         aa_version: 'mdt',
-        packed_user_op: packed_user_op_json,
+        user_op: user_op_json,
         cohort_id: cohortId,
         chain_id: chainId,
         context: context
     };
     const requestB64 = Buffer.from(JSON.stringify(requestData)).toString('base64');
+
+    console.log(`>>>>> requestData: ${JSON.stringify(requestData, null, 2)}`);
 
     const signingRequests = ursulaChecksums.reduce((acc, checksum) => {
         acc[checksum] = requestB64;

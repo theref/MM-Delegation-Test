@@ -281,6 +281,23 @@ async function executeViaMultisig({
             verificationGasLimit: 500_000
         });
 
+        logger.debug(">>> UserOperation");
+        logger.debug(`> sender: ${userOperation.sender}`);
+        logger.debug(`> nonce: ${userOperation.nonce}`);
+        logger.debug(`> factory: ${userOperation.factory}`);
+        logger.debug(`> factoryData: ${userOperation.factoryData}`);
+        logger.debug(`> callData: ${userOperation.callData}`);
+        logger.debug(`> callGasLimit: ${userOperation.callGasLimit}`);
+        logger.debug(`> verificationGasLimit: ${userOperation.verificationGasLimit}`);
+        logger.debug(`> preVerificationGas: ${userOperation.preVerificationGas}`);
+        logger.debug(`> maxFeePerGas: ${userOperation.maxFeePerGas}`);
+        logger.debug(`> maxPriorityFeePerGas: ${userOperation.maxPriorityFeePerGas}`);
+        logger.debug(`> paymaster: ${userOperation.paymaster}`);
+        logger.debug(`> paymasterVerificationGasLimit: ${userOperation.paymasterVerificationGasLimit}`);
+        logger.debug(`> paymasterPostOpGasLimit: ${userOperation.paymasterPostOpGasLimit}`);
+        logger.debug(`> paymasterData: ${userOperation.paymasterData}`);
+        logger.debug(`> signature: ${userOperation.signature}`);
+
         const packedUserOp = packUserOp(userOperation);
         logger.debug(">>> PackedUserOp");
         logger.debug(`> sender: ${packedUserOp.sender}`);
@@ -297,7 +314,7 @@ async function executeViaMultisig({
         logger.debug(`Requesting signatures from Porter...`);
         const { signatures: porterSignatures, claimedSigners, messageHash: porterHash } = await requestSignaturesFromPorter(
             PORTER_BASE_URL,
-            packedUserOp,
+            userOperation,
             porterChecksums,
             Number(threshold),
             BASE_SEPOLIA_CHAIN_ID
