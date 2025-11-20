@@ -79,7 +79,7 @@ async function verifyAddress(
 }
 
 async function main() {
-  const provider = new ethers.JsonRpcProvider(process.env.RPC_URL!);
+  const provider = new ethers.providers.JsonRpcProvider(process.env.RPC_URL!);
   const publicClient = createPublicClient({
     chain: baseSepolia,
     transport: http(process.env.RPC_URL),
@@ -136,9 +136,9 @@ async function main() {
 
   if (!tempUserOp.factoryData) throw new Error("Could not get factory data");
 
-  const iface = new ethers.Interface(["function deploy(bytes,bytes32)"]);
+  const iface = new ethers.utils.Interface(["function deploy(bytes,bytes32)"]);
   const [bytecode] = iface.decodeFunctionData("deploy", tempUserOp.factoryData);
-  const bytecodeHash = ethers.keccak256(bytecode as string) as Hex;
+  const bytecodeHash = ethers.utils.keccak256(bytecode as string) as Hex;
 
   console.log(`Bytecode Hash: ${bytecodeHash}\n`);
   console.log("Verifying addresses...\n");

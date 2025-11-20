@@ -11,9 +11,8 @@ import {
     Implementation,
     toMetaMaskSmartAccount,
 } from '@metamask/delegation-toolkit';
-import { aggregateSignature, createUserOpHashV07, DeleGatorEnvironment, getDeleGatorEnvironment, packUserOp, SIGNABLE_USER_OP_TYPED_DATA } from '@metamask/delegation-utils';
-import { ethers, TypedDataEncoder, keccak256, AbiCoder } from 'ethers';
-import { Address, createPublicClient, Hex, http, parseEther, toHex, zeroAddress } from 'viem';
+import { ethers } from 'ethers';
+import { Address, createPublicClient, Hex, http, parseEther, zeroAddress } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { 
     createPaymasterClient,
@@ -22,13 +21,9 @@ import {
 import { baseSepolia } from 'viem/chains';
 import * as dotenv from 'dotenv';
 import winston, { Logger } from 'winston';
+import { SigningCoordinator, SigningCoordinatorAgent } from '@nucypher/shared';
+import { initialize, domains, signUserOp } from '@nucypher/taco';
 
-// Import from the Porter Signer library
-import {
-    getPorterChecksums as getPorterChecksumsFromLibrary, 
-    requestSignaturesFromPorter,
-    verifySignaturesOnChainViaEIP1271
-} from './porter_signer';
 
 // Parse command line arguments
 const args = process.argv.slice(2);
@@ -74,54 +69,26 @@ dotenv.config();
 var ENTRY_POINT_ADDRESS = "0x0000000071727De22E5E9d8BAf0edAc6f37da032" as Address; // v_0_7 (currently used by MDT)
 
 const BASE_SEPOLIA_CHAIN_ID = 84532;
-const MULTISIG_CONTRACT_THRESHOLD = 2;
-const MULTISIG_ADDRESS = "0x42F30AEc1A36995eEFaf9536Eb62BD751F982D32" as Address;
-const PORTER_BASE_URL = "https://porter-lynx.nucypher.io";
+const COHORT_ID = 1;
+const TACO_DOMAIN = domains.DEVNET;
+const ETH_PROVIDER = new ethers.providers.JsonRpcProvider("https://sepolia.drpc.org");
 
-const MULTISIG_ABI = [
-    "function nonce() view returns (uint256)",
-    "function getUnsignedTransactionHash(address sender, address destination, uint256 value, bytes memory data, uint256 nonce) view returns (bytes32)",
-    "function execute(address destination, uint256 value, bytes memory data, bytes memory signature)",
-    "function getSigners() view returns (address[])",
-    "function threshold() view returns (uint16)"
-] as const;
-
-async function getPorterChecksums(): Promise<`0x${string}`[]> {
-    return getPorterChecksumsFromLibrary(PORTER_BASE_URL, 3);
-}
-
-async function fundAddress(
-    provider: ethers.JsonRpcProvider,
-    toAddress: string,
-    amount: bigint
-) {
-    const wallet = new ethers.Wallet(process.env.PRIVATE_KEY!, provider);
-    logger.info(`Attempting to fund ${toAddress} with ${ethers.formatEther(amount)} ETH from ${wallet.address}...`)
-    const tx = {
-        to: toAddress,
-        value: amount
-    };
-    const txResponse = await wallet.sendTransaction(tx);
-    logger.verbose(`Funding transaction sent: ${txResponse.hash}`);
-    logger.verbose(`View on Etherscan: https://sepolia.basescan.org/tx/${txResponse.hash}`);
-    await txResponse.wait();
-    logger.info('Funding transaction confirmed');
-}
-
-async function logBalance(label: string, provider: ethers.JsonRpcProvider, address: string) {
+async function logBalance(label: string, provider: ethers.providers.JsonRpcProvider, address: string) {
     const balance = await provider.getBalance(address);
-    logger.info(`${label} balance: ${ethers.formatEther(balance)} ETH`);
+    logger.info(`${label} balance: ${ethers.utils.formatEther(balance)} ETH`);
 }
 
 async function setupEnvironment() {
+    await initialize();
+
     logger.info('--- SETUP ---');
     if (!process.env.RPC_URL) throw new Error('Please set RPC_URL in your .env file');
     if (!process.env.PRIVATE_KEY) throw new Error('Please set PRIVATE_KEY in your .env file');
     if (!process.env.BUNDLER_URL) throw new Error('Please set BUNDLER_URL in your .env file (needed for Pimlico client for gas prices)');
 
-    const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
+    const provider = new ethers.providers.JsonRpcProvider(process.env.RPC_URL);
     const network = await provider.getNetwork();
-    if (network.chainId !== BigInt(BASE_SEPOLIA_CHAIN_ID)) {
+    if (network.chainId !== BASE_SEPOLIA_CHAIN_ID) {
         throw new Error(`Wrong network. Expected Base Sepolia (${BASE_SEPOLIA_CHAIN_ID}), got chain ID ${network.chainId}`);
     }
 
@@ -157,70 +124,59 @@ async function setupEnvironment() {
     const {fast: fees} = await pimlicoClient.getUserOperationGasPrice();
     
     const localAccount = privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`);
-    const eoaWallet = new ethers.Wallet(process.env.PRIVATE_KEY as string, provider);
 
-    const porterChecksums = await getPorterChecksums();
     logger.info("Setup complete. Returning environment...");
     return {
-        provider,
+        provider: provider,
         publicClient,
         pimlicoClient,
         fees,
         bundlerClient,
         localAccount,
-        eoaWallet,
-        porterChecksums,
     };
 }
 
 async function deployAndSetupSmartAccount({
     publicClient,
     localAccount,
-    pimlicoClient, 
-    bundlerClient,
     provider,
-    porterChecksums,
 }: any) {
     logger.info('--- DEPLOYING USER SMART ACCOUNT ---');
 
-    // Get signers and threshold from MultiSig contract
-    const multisigContract = new ethers.Contract(MULTISIG_ADDRESS, MULTISIG_ABI, provider);
-    const signers = await multisigContract.getSigners();
-    const threshold = await multisigContract.threshold();
+    // Get signers and threshold from SigningCoordinator
+    const participants = await SigningCoordinatorAgent.getParticipants(ETH_PROVIDER, TACO_DOMAIN, COHORT_ID)
+    const signers = participants.map(p => p.signerAddress as Address);
+
+    const threshold = await SigningCoordinatorAgent.getThreshold(ETH_PROVIDER, TACO_DOMAIN, COHORT_ID);
+
     logger.info(`Got ${signers.length} signers from MultiSig contract with threshold ${threshold}`);
     logger.debug(`Signers: ${signers.join(', ')}`);
 
     const userSmartAccount = await toMetaMaskSmartAccount({
         client: publicClient,
         implementation: Implementation.MultiSig,
-        deployParams: [signers, threshold],
+        deployParams: [signers, BigInt(threshold)],
         deploySalt: "0x" as Hex,
         signatory: [{
             account: localAccount
         }]
     });
 
-    const environment: DeleGatorEnvironment = getDeleGatorEnvironment(BASE_SEPOLIA_CHAIN_ID);
-    logger.debug(`>>>> environment ${JSON.stringify(environment)}`);
-
-    return { userSmartAccount, threshold };
+    return userSmartAccount;
 }
 
 async function executeViaMultisig({
     provider,
-    eoaWallet,
     userSmartAccount,
     localAccount,
-    porterChecksums,
     bundlerClient,
     pimlicoClient,
-    threshold,
-    publicClient
+    publicClient,
 }: any) {
     logger.info('--- EXECUTING VIA MULTISIG ---');
 
     const recipientAddress = localAccount.address;
-    const transferAmount = parseEther('0.0001'); 
+    const transferAmount = parseEther('0'); // 0 ETH for testing
 
     // Create the execution data
     const executionData = {
@@ -250,13 +206,13 @@ async function executeViaMultisig({
                 nonce = await publicClient.readContract({
                     address: userSmartAccount.address,
                     abi: [{
-                        name: 'nonce',
+                        name: 'getNonce',
                         type: 'function',
                         stateMutability: 'view',
                         inputs: [],
                         outputs: [{ type: 'uint256' }]
                     }],
-                    functionName: 'nonce',
+                    functionName: 'getNonce',
                 });
             } catch (error) {
                 logger.warn('Failed to read nonce from contract, defaulting to 0');
@@ -266,108 +222,39 @@ async function executeViaMultisig({
             nonce = 0;
             logger.debug(`Using initCode: ${userSmartAccount.initCode}`);
         }
+        logger.debug(`Using nonce: ${nonce}`);
 
         // Construct the user operation
         const userOperation = await bundlerClient!.prepareUserOperation({
             account: userSmartAccount,
             calls: [
-                {
-                  target: zeroAddress,
-                  value: 0n,
-                  data: "0x",
-                }
+                executionData,
               ],
             ...fee,
             verificationGasLimit: 500_000
         });
 
-        logger.debug(">>> UserOperation");
-        logger.debug(`> sender: ${userOperation.sender}`);
-        logger.debug(`> nonce: ${userOperation.nonce}`);
-        logger.debug(`> factory: ${userOperation.factory}`);
-        logger.debug(`> factoryData: ${userOperation.factoryData}`);
-        logger.debug(`> callData: ${userOperation.callData}`);
-        logger.debug(`> callGasLimit: ${userOperation.callGasLimit}`);
-        logger.debug(`> verificationGasLimit: ${userOperation.verificationGasLimit}`);
-        logger.debug(`> preVerificationGas: ${userOperation.preVerificationGas}`);
-        logger.debug(`> maxFeePerGas: ${userOperation.maxFeePerGas}`);
-        logger.debug(`> maxPriorityFeePerGas: ${userOperation.maxPriorityFeePerGas}`);
-        logger.debug(`> paymaster: ${userOperation.paymaster}`);
-        logger.debug(`> paymasterVerificationGasLimit: ${userOperation.paymasterVerificationGasLimit}`);
-        logger.debug(`> paymasterPostOpGasLimit: ${userOperation.paymasterPostOpGasLimit}`);
-        logger.debug(`> paymasterData: ${userOperation.paymasterData}`);
-        logger.debug(`> signature: ${userOperation.signature}`);
-
-        const packedUserOp = packUserOp(userOperation);
-        logger.debug(">>> PackedUserOp");
-        logger.debug(`> sender: ${packedUserOp.sender}`);
-        logger.debug(`> nonce: ${packedUserOp.nonce}`);
-        logger.debug(`> initCode: ${packedUserOp.initCode}`);
-        logger.debug(`> callData: ${packedUserOp.callData}`);
-        logger.debug(`> accounGasLimits: ${packedUserOp.accountGasLimits}`);
-        logger.debug(`> preVerificationGas: ${packedUserOp.preVerificationGas}`);
-        logger.debug(`> gasFees: ${packedUserOp.gasFees}`);
-        logger.debug(`> paymasterAndData: ${packedUserOp.paymasterAndData}`);
-        logger.debug(`> signature: ${packedUserOp.signature}`);
-
         // Get signatures from Porter for the execution UserOperation
-        logger.debug(`Requesting signatures from Porter...`);
-        const { signatures: porterSignatures, claimedSigners, messageHash: porterHash } = await requestSignaturesFromPorter(
-            PORTER_BASE_URL,
+        logger.debug(`Requesting signatures from TACo...`);
+        const result = await signUserOp(
+            ETH_PROVIDER,
+            TACO_DOMAIN,
+            COHORT_ID,
+            BASE_SEPOLIA_CHAIN_ID,
             userOperation,
-            porterChecksums,
-            Number(threshold),
-            BASE_SEPOLIA_CHAIN_ID
+            'mdt',
         );
-        logger.debug(`Got signatures from Porter: ${JSON.stringify(porterSignatures)}`);
-        logger.debug(`Claimed signers: ${claimedSigners.join(', ')}`);
-        logger.debug(`Porter hash: ${porterHash}`);
-        // Verify we have enough signatures
-        if (Object.keys(porterSignatures).length < Number(threshold)) {
-            throw new Error(`Not enough signatures. Required: ${threshold}, Got: ${Object.keys(porterSignatures).length}`);
-        }
+        logger.debug(`Message hash: ${result.messageHash}`);
+        logger.debug(`Aggregated signature: ${result.aggregatedSignature}`);
 
-        // Aggregate the signatures using the MetaMask Delegation Toolkit
-        const signatureObjects = Object.entries(porterSignatures).map(([_, [signer, signature]]) => ({
-            signer: signer as `0x${string}`,
-            signature: signature as `0x${string}`,
-            type: "ECDSA" as const
-        }));
-
-        const aggregatedSignature = aggregateSignature({
-            signatures: signatureObjects
-        });
-        logger.debug(`Aggregated signature: ${aggregatedSignature}`);
-
-        // Send the UserOperation with the aggregated signature
-        logger.debug(`Sending user operation with signature...`);
-        
         try {
             const userOperationHash = await bundlerClient!.sendUserOperation({
                 ...userOperation,
-                signature: aggregatedSignature,
+                signature: result.aggregatedSignature,
             });
             logger.verbose(`Execution UserOp sent: ${userOperationHash}. Waiting for receipt...`);
             const { receipt } = await bundlerClient!.waitForUserOperationReceipt({ hash: userOperationHash });
             logger.info(`Execution completed, tx: ${receipt.transactionHash}`);
-
-            // Verify the signature after the operation is sent
-            try {
-                const isValid = await verifySignaturesOnChainViaEIP1271(
-                    provider,
-                    userSmartAccount.address,
-                    porterHash as `0x${string}`,
-                    aggregatedSignature
-                );
-                if (!isValid) {
-                    logger.warn('Signature verification failed after operation was sent');
-                } else {
-                    logger.info('Signature verification successful');
-                }
-            } catch (error: any) {
-                logger.warn('Failed to verify signature after operation was sent');
-                logger.warn(`Error: ${error.message}`);
-            }
 
             await logBalance(`Local EOA (${localAccount.address}) AFTER transfer`, provider, localAccount.address);
             await logBalance('User Smart Account AFTER transfer', provider, userSmartAccount.address);
@@ -391,21 +278,17 @@ async function executeViaMultisig({
 (async function main() {
     try {
         const env = await setupEnvironment();
-        const { userSmartAccount, threshold } = await deployAndSetupSmartAccount({
+        const userSmartAccount = await deployAndSetupSmartAccount({
             ...env,
             provider: env.provider,
-            porterChecksums: env.porterChecksums
         });
         
-        // logger.info("--- Funding User Smart Account ---");
-        // await fundAddress(env.provider, userSmartAccount.address, parseEther('0.0001'));
         await logBalance('User Smart Account before transfer', env.provider, userSmartAccount.address);
         await logBalance(`Local EOA (${env.localAccount.address}) before transfer`, env.provider, env.localAccount.address);
 
         await executeViaMultisig({
             ...env,
             userSmartAccount,
-            threshold,
             publicClient: env.publicClient
         });
 

@@ -18,11 +18,11 @@
   "dependencies": {
     "@metamask/delegation-toolkit": "^0.11.0",
     "@metamask/delegation-utils": "^0.11.0",
-    "@nucypher/taco": "^0.6.0",
-    "@nucypher/taco-auth": "^0.3.0",
+    "@nucypher/shared": "^0.6.0-alpha.5",
+    "@nucypher/taco": "^0.7.0-alpha.5",
     "@types/winston": "^2.4.4",
     "dotenv": "^16.5.0",
-    "ethers": "^6.11.1",
+    "ethers": "^5.8.0",
     "permissionless": "^0.2.44",
     "viem": "^2.7.9",
     "winston": "^3.17.0"
